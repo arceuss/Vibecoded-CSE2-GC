@@ -216,11 +216,16 @@ static inline void MarkTexturesDirty(void)
 }
 
 // Ensure texture cache is valid before drawing
+// Note: Since we invalidate all caches at frame start (following libogc examples),
+// mid-frame invalidation is only needed if textures were modified THIS frame
 static inline void EnsureTextureCacheValid(void)
 {
 	if (textures_dirty)
 	{
-		InvalidateTextureCache();
+		// Texture was modified mid-frame, need to sync and invalidate
+		GPU_Sync();
+		GX_InvalidateTexAll();
+		textures_dirty = false;
 	}
 }
 
@@ -624,12 +629,15 @@ void RenderBackend_DrawScreen(void)
 	GXColor bg = {0, 0, 0, 0xFF};
 	GX_SetCopyClear(bg, GX_MAX_Z24);
 	
-	// Invalidate texture cache for clean frame start
+	// === FRAME START SETUP (for next frame) ===
+	// Following libogc examples pattern: invalidate ALL caches at frame start
+	// This must be done BEFORE any drawing of the next frame
+	GX_InvVtxCache();
 	GX_InvalidateTexAll();
 	textures_dirty = false;
 	
-	// Note: We do NOT reset state machine here - let state persist between frames
-	// The state machine tracks GPU state correctly, so there's no mismatch
+	// Reset draw state so first draw of next frame sets up vertex descriptors fresh
+	current_draw_state = GX_DRAW_STATE_NONE;
 	
 	if (frame_count <= 5 || frame_count % 60 == 0)
 		GC_LOG("Frame %d", frame_count);

@@ -690,6 +690,8 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 		else
 			GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
 		
+		// Invalidate texture cache before EVERY texture load to prevent random tile corruption
+		GX_InvalidateTexAll();
 		GX_LoadTexObj(&source_surface->texObj, GX_TEXMAP0);
 		
 		GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
@@ -1071,6 +1073,9 @@ void RenderBackend_DrawGlyph(long x, long y, size_t gx, size_t gy, size_t gw, si
 	// Alpha blend for text
 	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
 	GX_SetAlphaCompare(GX_GREATER, 8, GX_AOP_AND, GX_ALWAYS, 0);
+	
+	// Invalidate texture cache before loading atlas
+	GX_InvalidateTexAll();
 	
 	// Load atlas texture
 	GX_LoadTexObj(&glyph_atlas->texObj, GX_TEXMAP0);

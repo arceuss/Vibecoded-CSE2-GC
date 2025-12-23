@@ -24,9 +24,5 @@ external/SDL2/
 external/freetype/
 external/glfw/
 
-# Game data (copyrighted, users need to provide their own)
-game_english/
-game_japanese/
-
 # Compiled tools
 bin2h/*.exe

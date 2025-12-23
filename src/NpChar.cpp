@@ -162,7 +162,7 @@ BOOL LoadEvent(const char *path_event)
 	NPCHAR_LOG("  -> Not in embedded data, trying filesystem...");
 #endif
 
-	fp = fopen(path.c_str(), "rb");
+	fp = fopen(path, "rb");
 	if (fp == NULL)
 		return FALSE;
 

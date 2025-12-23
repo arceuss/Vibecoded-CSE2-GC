@@ -106,6 +106,14 @@ static RenderBackend_GlyphAtlas *glyph_atlas = NULL;
 static RenderBackend_Surface *glyph_dest = NULL;
 static u8 glyph_r, glyph_g, glyph_b;
 
+// Pre-allocated buffer for EFB copies (BackupSurface)
+// This avoids repeated large allocations that can fragment memory
+// Max size: 512x256 in RGBA8 = 512KB (covers most use cases)
+#define EFB_COPY_MAX_WIDTH 512
+#define EFB_COPY_MAX_HEIGHT 256
+#define EFB_COPY_BUFFER_SIZE (EFB_COPY_MAX_WIDTH * EFB_COPY_MAX_HEIGHT * 4)
+static void *efb_copy_buffer = NULL;
+
 // Debug
 static int frame_count = 0;
 
@@ -573,6 +581,18 @@ RenderBackend_Surface* RenderBackend_Init(const char *window_title, size_t width
 	
 	current_target = framebuffer_surface;
 	
+	// Allocate EFB copy buffer (used by BackupSurface)
+	efb_copy_buffer = memalign(32, EFB_COPY_BUFFER_SIZE);
+	if (!efb_copy_buffer)
+	{
+		GC_LOG("WARNING: EFB copy buffer alloc failed - BackupSurface will be disabled");
+	}
+	else
+	{
+		memset(efb_copy_buffer, 0, EFB_COPY_BUFFER_SIZE);
+		GC_LOG("EFB copy buffer: %d KB", EFB_COPY_BUFFER_SIZE / 1024);
+	}
+	
 	// Ensure GPU is ready
 	GX_DrawDone();
 	GX_InvalidateTexAll();
@@ -585,6 +605,11 @@ void RenderBackend_Deinit(void)
 {
 	GPU_Sync();
 	
+	if (efb_copy_buffer)
+	{
+		free(efb_copy_buffer);
+		efb_copy_buffer = NULL;
+	}
 	if (framebuffer_surface)
 	{
 		free(framebuffer_surface);
@@ -806,6 +831,13 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 	{
 		if (!destination_surface || !destination_surface->texture_data) return;
 		
+		// Check if EFB copy buffer is available
+		if (!efb_copy_buffer)
+		{
+			GC_LOG("BackupSurface: No EFB copy buffer available");
+			return;
+		}
+		
 		// Wait for all GPU commands to complete before EFB access
 		GPU_Sync();
 		
@@ -828,14 +860,19 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 		// Temp texture dimensions (power of 2)
 		size_t temp_tex_w = NextPow2(efb_w);
 		size_t temp_tex_h = NextPow2(efb_h);
+		
+		// Clamp to pre-allocated buffer size
+		if (temp_tex_w > EFB_COPY_MAX_WIDTH) temp_tex_w = EFB_COPY_MAX_WIDTH;
+		if (temp_tex_h > EFB_COPY_MAX_HEIGHT) temp_tex_h = EFB_COPY_MAX_HEIGHT;
+		
+		// Recalculate EFB dimensions to match buffer constraints
+		if (efb_w > temp_tex_w) efb_w = temp_tex_w;
+		if (efb_h > temp_tex_h) efb_h = temp_tex_h;
+		
 		size_t temp_size = temp_tex_w * temp_tex_h * 4;  // RGBA8
 		
-		void *temp_tex = memalign(32, temp_size);
-		if (!temp_tex)
-		{
-			GC_LOG("BackupSurface: Failed to allocate temp buffer");
-			return;
-		}
+		// Use pre-allocated buffer instead of allocating every time
+		void *temp_tex = efb_copy_buffer;
 		memset(temp_tex, 0, temp_size);
 		
 		// Invalidate cache before GPU writes
@@ -911,7 +948,7 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 			}
 		}
 		
-		free(temp_tex);
+		// Note: temp_tex is pre-allocated buffer, don't free it
 		
 		// Flush destination and mark dirty
 		FlushSurfaceTexture(destination_surface);

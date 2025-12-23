@@ -16,8 +16,42 @@
 
 #include <gccore.h>
 #include <ogc/gx.h>
+#include <ogc/system.h>
 
 #define GC_LOG(fmt, ...) printf("[GX Render] " fmt "\n", ##__VA_ARGS__)
+
+// Memory debugging
+static u32 initial_arena_size = 0;
+static u32 min_arena_size = 0xFFFFFFFF;  // Track lowest seen
+
+// Safe allocation with logging
+static void* SafeMalloc(size_t size, const char* what)
+{
+	void* ptr = malloc(size);
+	if (!ptr && size > 0)
+	{
+		u32 arena_free = SYS_GetArena1Size();
+		printf("[FATAL] malloc(%zu) failed for %s! Arena free: %uKB\n", 
+			size, what, arena_free / 1024);
+		// Hang so we can see the message
+		while(1) { VIDEO_WaitVSync(); }
+	}
+	return ptr;
+}
+
+static void* SafeMemalign(size_t align, size_t size, const char* what)
+{
+	void* ptr = memalign(align, size);
+	if (!ptr && size > 0)
+	{
+		u32 arena_free = SYS_GetArena1Size();
+		printf("[FATAL] memalign(%zu, %zu) failed for %s! Arena free: %uKB\n", 
+			align, size, what, arena_free / 1024);
+		// Hang so we can see the message
+		while(1) { VIDEO_WaitVSync(); }
+	}
+	return ptr;
+}
 
 // Game resolution - 320x240, GX hardware scales to 640x480 output
 #define GAME_WIDTH 320
@@ -597,7 +631,11 @@ RenderBackend_Surface* RenderBackend_Init(const char *window_title, size_t width
 	GX_DrawDone();
 	GX_InvalidateTexAll();
 	
-	GC_LOG("Init complete!");
+	// Record initial memory state
+	initial_arena_size = SYS_GetArena1Size();
+	min_arena_size = initial_arena_size;
+	GC_LOG("Init complete! Free Arena: %uKB", initial_arena_size / 1024);
+	
 	return framebuffer_surface;
 }
 
@@ -664,8 +702,19 @@ void RenderBackend_DrawScreen(void)
 	// Reset draw state so first draw of next frame sets up vertex descriptors fresh
 	current_draw_state = GX_DRAW_STATE_NONE;
 	
-	if (frame_count <= 5 || frame_count % 60 == 0)
-		GC_LOG("Frame %d", frame_count);
+	// Memory debugging - check every 5 seconds (300 frames at 60fps)
+	if (frame_count % 300 == 0)
+	{
+		u32 arena_size = SYS_GetArena1Size();
+		if (initial_arena_size == 0)
+			initial_arena_size = arena_size;
+		if (arena_size < min_arena_size)
+			min_arena_size = arena_size;
+		
+		u32 used = initial_arena_size - arena_size;
+		GC_LOG("Frame %d - Arena: %uKB free (used: %uKB, min: %uKB)", 
+			frame_count, arena_size / 1024, used / 1024, min_arena_size / 1024);
+	}
 }
 
 //==============================================================================
@@ -676,7 +725,7 @@ RenderBackend_Surface* RenderBackend_CreateSurface(size_t width, size_t height, 
 {
 	(void)render_target;
 	
-	RenderBackend_Surface *surface = (RenderBackend_Surface*)malloc(sizeof(RenderBackend_Surface));
+	RenderBackend_Surface *surface = (RenderBackend_Surface*)SafeMalloc(sizeof(RenderBackend_Surface), "surface struct");
 	if (!surface) return NULL;
 	
 	memset(surface, 0, sizeof(RenderBackend_Surface));
@@ -687,7 +736,7 @@ RenderBackend_Surface* RenderBackend_CreateSurface(size_t width, size_t height, 
 	surface->tex_size = surface->tex_width * surface->tex_height * 2;  // RGB5A3 = 2 bytes
 	
 	// Allocate 32-byte aligned texture data
-	surface->texture_data = memalign(32, surface->tex_size);
+	surface->texture_data = SafeMemalign(32, surface->tex_size, "surface texture");
 	if (!surface->texture_data)
 	{
 		GC_LOG("CreateSurface FAILED: %zux%zu", width, height);
@@ -762,7 +811,7 @@ void RenderBackend_UploadSurface(RenderBackend_Surface *surface, const unsigned 
 		if (surface->texture_data)
 			free(surface->texture_data);
 		
-		surface->texture_data = memalign(32, surface->tex_size);
+		surface->texture_data = SafeMemalign(32, surface->tex_size, "surface resize");
 		if (!surface->texture_data) return;
 		memset(surface->texture_data, 0, surface->tex_size);
 		
@@ -1176,7 +1225,7 @@ void RenderBackend_ColourFill(RenderBackend_Surface *surface, const RenderBacken
 
 RenderBackend_GlyphAtlas* RenderBackend_CreateGlyphAtlas(size_t width, size_t height)
 {
-	RenderBackend_GlyphAtlas *atlas = (RenderBackend_GlyphAtlas*)malloc(sizeof(RenderBackend_GlyphAtlas));
+	RenderBackend_GlyphAtlas *atlas = (RenderBackend_GlyphAtlas*)SafeMalloc(sizeof(RenderBackend_GlyphAtlas), "glyph atlas struct");
 	if (!atlas) return NULL;
 	
 	memset(atlas, 0, sizeof(RenderBackend_GlyphAtlas));
@@ -1186,7 +1235,7 @@ RenderBackend_GlyphAtlas* RenderBackend_CreateGlyphAtlas(size_t width, size_t he
 	atlas->tex_height = NextPow2(height);
 	atlas->tex_size = atlas->tex_width * atlas->tex_height * 2;  // IA8 = 2 bytes
 	
-	atlas->texture_data = memalign(32, atlas->tex_size);
+	atlas->texture_data = SafeMemalign(32, atlas->tex_size, "glyph atlas texture");
 	if (!atlas->texture_data)
 	{
 		free(atlas);

@@ -2,7 +2,6 @@
 // See LICENCE.txt for details.
 
 // GameCube GX Hardware Renderer for CSE2
-// Rewritten with state machine for GX setup and explicit cache management
 
 #include "../Rendering.h"
 #include "../Misc.h"
@@ -16,102 +15,52 @@
 
 #include <gccore.h>
 #include <ogc/gx.h>
-#include <ogc/system.h>
 
 #define GC_LOG(fmt, ...) printf("[GX Render] " fmt "\n", ##__VA_ARGS__)
-
-// Memory debugging
-static u32 initial_arena_size = 0;
-static u32 min_arena_size = 0xFFFFFFFF;  // Track lowest seen
-
-// Safe allocation with logging
-static void* SafeMalloc(size_t size, const char* what)
-{
-	void* ptr = malloc(size);
-	if (!ptr && size > 0)
-	{
-		u32 arena_free = SYS_GetArena1Size();
-		printf("[FATAL] malloc(%zu) failed for %s! Arena free: %uKB\n", 
-			size, what, arena_free / 1024);
-		// Hang so we can see the message
-		while(1) { VIDEO_WaitVSync(); }
-	}
-	return ptr;
-}
-
-static void* SafeMemalign(size_t align, size_t size, const char* what)
-{
-	void* ptr = memalign(align, size);
-	if (!ptr && size > 0)
-	{
-		u32 arena_free = SYS_GetArena1Size();
-		printf("[FATAL] memalign(%zu, %zu) failed for %s! Arena free: %uKB\n", 
-			align, size, what, arena_free / 1024);
-		// Hang so we can see the message
-		while(1) { VIDEO_WaitVSync(); }
-	}
-	return ptr;
-}
 
 // Game resolution - 320x240, GX hardware scales to 640x480 output
 #define GAME_WIDTH 320
 #define GAME_HEIGHT 240
-#define EFB_WIDTH 640
-#define EFB_HEIGHT 480
 
 // GX texture format - use RGB5A3 for color key support
 // RGB5A3: if MSB=1: RGB555, if MSB=0: ARGB3444
 #define TEXTURE_FORMAT GX_TF_RGB5A3
 
-//==============================================================================
-// GX State Machine
-//==============================================================================
+// Texture cache invalidation tracking - avoids redundant invalidations
+static bool textures_need_invalidation = false;
 
-typedef enum {
-	GX_DRAW_STATE_NONE = 0,     // Unknown/uninitialized
-	GX_DRAW_STATE_TEXTURED,     // Textured quad (pos + texcoord)
-	GX_DRAW_STATE_COLORFILL,    // Color fill (pos + color)
-	GX_DRAW_STATE_GLYPH,        // Glyph rendering (pos + color + texcoord)
-} GXDrawState;
+// Helper to mark textures dirty (deferred invalidation)
+static inline void MarkTexturesDirty(void)
+{
+	textures_need_invalidation = true;
+}
 
-typedef enum {
-	GX_PROJ_NORMAL = 0,         // 320x240 projection
-	GX_PROJ_HIRES,              // 640x480 projection
-} GXProjectionState;
+// Helper to sync GPU and invalidate texture cache if needed
+static inline void SyncAndInvalidateTextures(void)
+{
+	if (textures_need_invalidation)
+	{
+		// Wait for all pending GX commands to complete
+		GX_DrawDone();
+		// Now safe to invalidate texture cache
+		GX_InvalidateTexAll();
+		textures_need_invalidation = false;
+	}
+}
 
-typedef enum {
-	GX_BLEND_NONE = 0,          // No blending
-	GX_BLEND_ALPHA,             // Alpha blending
-} GXBlendState;
-
-// Current GX state tracking
-static GXDrawState current_draw_state = GX_DRAW_STATE_NONE;
-static GXProjectionState current_projection = GX_PROJ_NORMAL;
-static GXBlendState current_blend = GX_BLEND_NONE;
-static bool alpha_test_enabled = false;
-static u8 alpha_test_threshold = 0;
-
-// Texture cache tracking
-static bool textures_dirty = false;
-static bool gpu_pending = false;  // True if there are pending GPU commands
-
-//==============================================================================
-// Surface Structure
-//==============================================================================
-
+// Surface structure - holds GX texture
 struct RenderBackend_Surface {
 	GXTexObj texObj;
-	void *texture_data;     // 32-byte aligned texture data
+	void *texture_data;  // 32-byte aligned texture data
 	size_t width;
 	size_t height;
-	size_t tex_width;       // Power of 2 width
-	size_t tex_height;      // Power of 2 height
-	size_t tex_size;        // Total texture size in bytes
-	bool has_colorkey;      // Has transparent pixels
-	bool is_hires;          // Hi-res text surface
-	bool texture_valid;     // Texture cache is valid (flushed and not modified)
+	size_t tex_width;    // Power of 2 width
+	size_t tex_height;   // Power of 2 height
+	bool has_colorkey;   // Has transparent pixels
+	bool is_hires;       // Hi-res text surface (uses 640x480 projection when blitting)
 };
 
+// Glyph atlas
 struct RenderBackend_GlyphAtlas {
 	GXTexObj texObj;
 	void *texture_data;
@@ -119,20 +68,18 @@ struct RenderBackend_GlyphAtlas {
 	size_t height;
 	size_t tex_width;
 	size_t tex_height;
-	size_t tex_size;
-	bool texture_valid;
 };
 
-//==============================================================================
-// Global State
-//==============================================================================
-
+// Video globals
 static GXRModeObj *vmode = NULL;
 static void *xfb[2] = {NULL, NULL};
 static int whichfb = 0;
 static void *gp_fifo = NULL;
 
+// Framebuffer surface (represents screen)
 static RenderBackend_Surface *framebuffer_surface = NULL;
+
+// Current render target
 static RenderBackend_Surface *current_target = NULL;
 
 // Glyph rendering state
@@ -140,21 +87,15 @@ static RenderBackend_GlyphAtlas *glyph_atlas = NULL;
 static RenderBackend_Surface *glyph_dest = NULL;
 static u8 glyph_r, glyph_g, glyph_b;
 
-// Pre-allocated buffer for EFB copies (BackupSurface)
-// This avoids repeated large allocations that can fragment memory
-// Max size: 512x256 in RGBA8 = 512KB (covers most use cases)
-#define EFB_COPY_MAX_WIDTH 512
-#define EFB_COPY_MAX_HEIGHT 256
-#define EFB_COPY_BUFFER_SIZE (EFB_COPY_MAX_WIDTH * EFB_COPY_MAX_HEIGHT * 4)
-static void *efb_copy_buffer = NULL;
+// Hi-res text rendering state (640x480 for text while game is 320x240)
+static bool in_hires_text_mode = false;
+static void SetupHiResTextProjection(void);
+static void RestoreNormalProjection(void);
 
 // Debug
 static int frame_count = 0;
 
-//==============================================================================
-// Utility Functions
-//==============================================================================
-
+// Round up to next power of 2
 static size_t NextPow2(size_t n)
 {
 	n--;
@@ -167,6 +108,7 @@ static size_t NextPow2(size_t n)
 	return n < 8 ? 8 : n;  // Minimum 8 for GX
 }
 
+// Convert RGB to RGB5A3 (with alpha for color key)
 static inline u16 RGB_to_RGB5A3(u8 r, u8 g, u8 b, bool transparent)
 {
 	if (transparent)
@@ -181,292 +123,78 @@ static inline u16 RGB_to_RGB5A3(u8 r, u8 g, u8 b, bool transparent)
 	}
 }
 
-// Get pixel from tiled RGB5A3 texture (4x4 tiles)
-static inline u16 GetTiledPixel(u16 *tex, size_t tex_width, size_t px, size_t py)
+// Setup GX for 2D rendering
+static void SetupGX(void)
 {
-	size_t tile_x = px / 4;
-	size_t tile_y = py / 4;
-	size_t in_tile_x = px % 4;
-	size_t in_tile_y = py % 4;
-	size_t tiles_per_row = tex_width / 4;
-	size_t tile_idx = tile_y * tiles_per_row + tile_x;
-	size_t pixel_in_tile = in_tile_y * 4 + in_tile_x;
-	return tex[tile_idx * 16 + pixel_in_tile];
-}
-
-// Set pixel in tiled RGB5A3 texture (4x4 tiles)
-static inline void SetTiledPixel(u16 *tex, size_t tex_width, size_t px, size_t py, u16 pixel)
-{
-	size_t tile_x = px / 4;
-	size_t tile_y = py / 4;
-	size_t in_tile_x = px % 4;
-	size_t in_tile_y = py % 4;
-	size_t tiles_per_row = tex_width / 4;
-	size_t tile_idx = tile_y * tiles_per_row + tile_x;
-	size_t pixel_in_tile = in_tile_y * 4 + in_tile_x;
-	tex[tile_idx * 16 + pixel_in_tile] = pixel;
-}
-
-// Get pixel from tiled IA8 texture (4x4 tiles)
-static inline void GetIA8Pixel(u8 *tex, size_t tex_width, size_t px, size_t py, u8 *alpha, u8 *intensity)
-{
-	size_t tile_x = px / 4;
-	size_t tile_y = py / 4;
-	size_t in_tile_x = px % 4;
-	size_t in_tile_y = py % 4;
-	size_t tiles_per_row = tex_width / 4;
-	size_t tile_idx = tile_y * tiles_per_row + tile_x;
-	size_t pixel_in_tile = in_tile_y * 4 + in_tile_x;
-	size_t byte_idx = tile_idx * 32 + pixel_in_tile * 2;
+	Mtx44 ortho;
+	Mtx identity;
 	
-	*alpha = tex[byte_idx];
-	*intensity = tex[byte_idx + 1];
-}
-
-//==============================================================================
-// GPU Synchronization and Cache Management
-//==============================================================================
-
-// Wait for GPU to finish all pending commands
-static inline void GPU_Sync(void)
-{
-	if (gpu_pending)
-	{
-		GX_DrawDone();
-		gpu_pending = false;
-	}
-}
-
-// Mark that GPU has pending work
-static inline void GPU_MarkPending(void)
-{
-	gpu_pending = true;
-}
-
-// Invalidate texture cache (call after textures modified)
-static void InvalidateTextureCache(void)
-{
-	GPU_Sync();
-	GX_InvalidateTexAll();
-	textures_dirty = false;
-}
-
-// Mark textures as needing invalidation
-static inline void MarkTexturesDirty(void)
-{
-	textures_dirty = true;
-}
-
-// Ensure texture cache is valid before drawing
-// Note: Since we invalidate all caches at frame start (following libogc examples),
-// mid-frame invalidation is only needed if textures were modified THIS frame
-static inline void EnsureTextureCacheValid(void)
-{
-	if (textures_dirty)
-	{
-		// Texture was modified mid-frame, need to sync and invalidate
-		GPU_Sync();
-		GX_InvalidateTexAll();
-		textures_dirty = false;
-	}
-}
-
-// Flush surface texture to main memory and mark dirty
-static void FlushSurfaceTexture(RenderBackend_Surface *surface)
-{
-	if (surface && surface->texture_data)
-	{
-		DCFlushRange(surface->texture_data, surface->tex_size);
-		surface->texture_valid = true;
-		MarkTexturesDirty();
-	}
-}
-
-// Flush atlas texture to main memory and mark dirty
-static void FlushAtlasTexture(RenderBackend_GlyphAtlas *atlas)
-{
-	if (atlas && atlas->texture_data)
-	{
-		DCFlushRange(atlas->texture_data, atlas->tex_size);
-		atlas->texture_valid = true;
-		MarkTexturesDirty();
-	}
-}
-
-// Prepare surface for CPU modification
-static void PrepareSurfaceForCPUWrite(RenderBackend_Surface *surface)
-{
-	if (!surface || !surface->texture_data || surface == framebuffer_surface)
-		return;
+	// Set viewport
+	GX_SetViewport(0, 0, vmode->fbWidth, vmode->efbHeight, 0, 1);
 	
-	// Wait for GPU to finish reading the texture
-	GPU_Sync();
+	// Set scissor
+	GX_SetScissor(0, 0, vmode->fbWidth, vmode->efbHeight);
 	
-	// Invalidate CPU cache to ensure we see latest data (if GPU wrote to it)
-	DCInvalidateRange(surface->texture_data, surface->tex_size);
+	// Orthographic projection for 2D
+	guOrtho(ortho, 0, GAME_HEIGHT, 0, GAME_WIDTH, 0, 1);
+	GX_LoadProjectionMtx(ortho, GX_ORTHOGRAPHIC);
 	
-	surface->texture_valid = false;
-}
-
-// Prepare atlas for CPU modification
-static void PrepareAtlasForCPUWrite(RenderBackend_GlyphAtlas *atlas)
-{
-	if (!atlas || !atlas->texture_data)
-		return;
+	// Identity modelview
+	guMtxIdentity(identity);
+	GX_LoadPosMtxImm(identity, GX_PNMTX0);
 	
-	GPU_Sync();
-	DCInvalidateRange(atlas->texture_data, atlas->tex_size);
-	atlas->texture_valid = false;
+	// Vertex format: position (x,y) + texcoord (s,t)
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+	
+	// TEV setup for textured quads
+	GX_SetNumChans(0);
+	GX_SetNumTexGens(1);
+	GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+	
+	GX_SetNumTevStages(1);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+	
+	// Alpha test for color key (discard pixels with alpha < 0.5)
+	GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
+	GX_SetZCompLoc(GX_TRUE);
+	
+	// Blending
+	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+	
+	// No Z buffer for 2D
+	GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+	
+	// Cull none
+	GX_SetCullMode(GX_CULL_NONE);
 }
 
-//==============================================================================
-// GX State Machine Functions
-//==============================================================================
-
-// Set projection matrix
-static void SetProjection(GXProjectionState proj)
+// Setup TEV for color fill
+static void SetupTEVColorFill(u8 r, u8 g, u8 b)
 {
-	if (current_projection != proj)
-	{
-		Mtx44 ortho;
-		if (proj == GX_PROJ_HIRES)
-		{
-			guOrtho(ortho, 0, EFB_HEIGHT, 0, EFB_WIDTH, 0, 1);
-		}
-		else
-		{
-			guOrtho(ortho, 0, GAME_HEIGHT, 0, GAME_WIDTH, 0, 1);
-		}
-		GX_LoadProjectionMtx(ortho, GX_ORTHOGRAPHIC);
-		current_projection = proj;
-	}
+	GX_SetNumChans(1);
+	GX_SetNumTexGens(0);
+	GX_SetNumTevStages(1);
+	
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+	
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+	
+	GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_VTX, GX_SRC_VTX, 0, GX_DF_NONE, GX_AF_NONE);
 }
 
-// Set blend mode
-static void SetBlendMode(GXBlendState blend)
+// Restore TEV for textured drawing
+static void SetupTEVTextured(void)
 {
-	if (current_blend != blend)
-	{
-		if (blend == GX_BLEND_ALPHA)
-		{
-			GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
-		}
-		else
-		{
-			GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
-		}
-		current_blend = blend;
-	}
-}
-
-// Set alpha test
-static void SetAlphaTest(bool enable, u8 threshold)
-{
-	if (alpha_test_enabled != enable || alpha_test_threshold != threshold)
-	{
-		if (enable)
-		{
-			GX_SetAlphaCompare(GX_GREATER, threshold, GX_AOP_AND, GX_ALWAYS, 0);
-		}
-		else
-		{
-			GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
-		}
-		alpha_test_enabled = enable;
-		alpha_test_threshold = threshold;
-	}
-}
-
-// Setup GX state for textured quad drawing
-static void SetDrawState_Textured(void)
-{
-	if (current_draw_state != GX_DRAW_STATE_TEXTURED)
-	{
-		// Wait for any pending draws to complete before changing vertex format
-		if (current_draw_state != GX_DRAW_STATE_NONE)
-			GX_DrawDone();
-		
-		GX_SetNumChans(0);
-		GX_SetNumTexGens(1);
-		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
-		
-		GX_SetNumTevStages(1);
-		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
-		GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
-		
-		GX_ClearVtxDesc();
-		GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-		GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
-		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
-		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
-		
-		current_draw_state = GX_DRAW_STATE_TEXTURED;
-	}
-}
-
-// Setup GX state for solid color fill
-static void SetDrawState_ColorFill(void)
-{
-	if (current_draw_state != GX_DRAW_STATE_COLORFILL)
-	{
-		// Wait for any pending draws to complete before changing vertex format
-		if (current_draw_state != GX_DRAW_STATE_NONE)
-			GX_DrawDone();
-		
-		GX_SetNumChans(1);
-		GX_SetNumTexGens(0);
-		GX_SetNumTevStages(1);
-		
-		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
-		GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
-		
-		GX_ClearVtxDesc();
-		GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-		GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
-		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
-		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
-		
-		GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_VTX, GX_SRC_VTX, 0, GX_DF_NONE, GX_AF_NONE);
-		
-		current_draw_state = GX_DRAW_STATE_COLORFILL;
-	}
-}
-
-// Setup GX state for glyph rendering (texture + vertex color)
-static void SetDrawState_Glyph(void)
-{
-	if (current_draw_state != GX_DRAW_STATE_GLYPH)
-	{
-		// Wait for any pending draws to complete before changing vertex format
-		if (current_draw_state != GX_DRAW_STATE_NONE)
-			GX_DrawDone();
-		
-		GX_SetNumChans(1);
-		GX_SetNumTexGens(1);
-		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
-		
-		GX_SetNumTevStages(1);
-		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
-		GX_SetTevOp(GX_TEVSTAGE0, GX_MODULATE);
-		
-		GX_ClearVtxDesc();
-		GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-		GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
-		GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
-		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
-		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
-		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
-		
-		GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_VTX, GX_SRC_VTX, 0, GX_DF_NONE, GX_AF_NONE);
-		
-		current_draw_state = GX_DRAW_STATE_GLYPH;
-	}
-}
-
-// Force full state setup at frame start (synchronizes tracking with actual GPU state)
-static void ForceDefaultState(void)
-{
-	// Force textured draw state as default
 	GX_SetNumChans(0);
 	GX_SetNumTexGens(1);
 	GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
@@ -480,62 +208,7 @@ static void ForceDefaultState(void)
 	GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
 	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
 	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
-	
-	current_draw_state = GX_DRAW_STATE_TEXTURED;
-	
-	// Force blend mode to none
-	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
-	current_blend = GX_BLEND_NONE;
-	
-	// Force alpha test to default (enabled with threshold 0)
-	GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
-	alpha_test_enabled = true;
-	alpha_test_threshold = 0;
-	
-	// Force normal projection
-	Mtx44 ortho;
-	guOrtho(ortho, 0, GAME_HEIGHT, 0, GAME_WIDTH, 0, 1);
-	GX_LoadProjectionMtx(ortho, GX_ORTHOGRAPHIC);
-	current_projection = GX_PROJ_NORMAL;
 }
-
-//==============================================================================
-// Initial GX Setup
-//==============================================================================
-
-static void InitialGXSetup(void)
-{
-	Mtx identity;
-	
-	// Set viewport to full EFB
-	GX_SetViewport(0, 0, vmode->fbWidth, vmode->efbHeight, 0, 1);
-	
-	// Set scissor to full EFB
-	GX_SetScissor(0, 0, vmode->fbWidth, vmode->efbHeight);
-	
-	// Identity modelview
-	guMtxIdentity(identity);
-	GX_LoadPosMtxImm(identity, GX_PNMTX0);
-	
-	// Z compare location before texture
-	GX_SetZCompLoc(GX_TRUE);
-	
-	// No Z buffer for 2D
-	GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
-	
-	// Cull none
-	GX_SetCullMode(GX_CULL_NONE);
-	
-	// Invalidate texture cache
-	GX_InvalidateTexAll();
-	
-	// Force default state (sets projection, vertex format, TEV, blend, alpha test)
-	ForceDefaultState();
-}
-
-//==============================================================================
-// Public API - Initialization
-//==============================================================================
 
 RenderBackend_Surface* RenderBackend_Init(const char *window_title, size_t width, size_t height, bool fullscreen)
 {
@@ -555,7 +228,7 @@ RenderBackend_Surface* RenderBackend_Init(const char *window_title, size_t width
 	}
 	GC_LOG("Video: %dx%d", vmode->fbWidth, vmode->xfbHeight);
 	
-	// Allocate XFB (double buffered)
+	// Allocate XFB
 	xfb[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(vmode));
 	xfb[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(vmode));
 	if (!xfb[0] || !xfb[1])
@@ -578,16 +251,14 @@ RenderBackend_Surface* RenderBackend_Init(const char *window_title, size_t width
 	if (vmode->viTVMode & VI_NON_INTERLACE)
 		VIDEO_WaitVSync();
 	
-	// Initialize GX with 256KB FIFO
-	gp_fifo = memalign(32, 256 * 1024);
+	// Initialize GX
+	gp_fifo = memalign(32, 256 * 1024);  // 256KB FIFO
 	if (!gp_fifo)
 	{
 		GC_LOG("ERROR: FIFO alloc failed!");
 		return NULL;
 	}
 	memset(gp_fifo, 0, 256 * 1024);
-	DCFlushRange(gp_fifo, 256 * 1024);
-	
 	GX_Init(gp_fifo, 256 * 1024);
 	GC_LOG("GX initialized");
 	
@@ -604,16 +275,15 @@ RenderBackend_Surface* RenderBackend_Init(const char *window_title, size_t width
 	GX_SetCopyFilter(vmode->aa, vmode->sample_pattern, GX_TRUE, vmode->vfilter);
 	GX_SetFieldMode(vmode->field_rendering, ((vmode->viHeight == 2 * vmode->xfbHeight) ? GX_ENABLE : GX_DISABLE));
 	
-	// Pixel format based on AA mode
 	if (vmode->aa)
 		GX_SetPixelFmt(GX_PF_RGB565_Z16, GX_ZC_LINEAR);
 	else
 		GX_SetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
 	
-	// Initial GX setup
-	InitialGXSetup();
+	// Setup for 2D rendering
+	SetupGX();
 	
-	// Create framebuffer surface (represents the screen)
+	// Create framebuffer surface struct (represents the screen)
 	framebuffer_surface = (RenderBackend_Surface*)malloc(sizeof(RenderBackend_Surface));
 	if (!framebuffer_surface)
 	{
@@ -623,43 +293,15 @@ RenderBackend_Surface* RenderBackend_Init(const char *window_title, size_t width
 	memset(framebuffer_surface, 0, sizeof(RenderBackend_Surface));
 	framebuffer_surface->width = GAME_WIDTH;
 	framebuffer_surface->height = GAME_HEIGHT;
-	framebuffer_surface->texture_valid = true;  // Screen is always "valid"
 	
 	current_target = framebuffer_surface;
 	
-	// Allocate EFB copy buffer (used by BackupSurface)
-	efb_copy_buffer = memalign(32, EFB_COPY_BUFFER_SIZE);
-	if (!efb_copy_buffer)
-	{
-		GC_LOG("WARNING: EFB copy buffer alloc failed - BackupSurface will be disabled");
-	}
-	else
-	{
-		memset(efb_copy_buffer, 0, EFB_COPY_BUFFER_SIZE);
-		GC_LOG("EFB copy buffer: %d KB", EFB_COPY_BUFFER_SIZE / 1024);
-	}
-	
-	// Ensure GPU is ready
-	GX_DrawDone();
-	GX_InvalidateTexAll();
-	
-	// Record initial memory state
-	initial_arena_size = SYS_GetArena1Size();
-	min_arena_size = initial_arena_size;
-	GC_LOG("Init complete! Free Arena: %uKB", initial_arena_size / 1024);
-	
+	GC_LOG("Init complete!");
 	return framebuffer_surface;
 }
 
 void RenderBackend_Deinit(void)
 {
-	GPU_Sync();
-	
-	if (efb_copy_buffer)
-	{
-		free(efb_copy_buffer);
-		efb_copy_buffer = NULL;
-	}
 	if (framebuffer_surface)
 	{
 		free(framebuffer_surface);
@@ -672,29 +314,24 @@ void RenderBackend_Deinit(void)
 	}
 }
 
-//==============================================================================
-// Public API - Frame Management
-//==============================================================================
-
 void RenderBackend_DrawScreen(void)
 {
 	frame_count++;
 	
-	// Ensure normal projection at frame end
-	SetProjection(GX_PROJ_NORMAL);
+	// Restore normal projection for next frame
+	RestoreNormalProjection();
 	
-	// Ensure all pending draws complete and flush FIFO
+	// Ensure any pending texture invalidations are processed
+	SyncAndInvalidateTextures();
+	
+	// Finish rendering
 	GX_DrawDone();
-	gpu_pending = false;
 	
 	// Copy EFB to XFB
 	GX_CopyDisp(xfb[whichfb], GX_TRUE);
-	
-	// Wait for copy to complete
-	GX_DrawDone();
 	GX_Flush();
 	
-	// Flip buffers
+	// Flip
 	VIDEO_SetNextFramebuffer(xfb[whichfb]);
 	VIDEO_Flush();
 	VIDEO_WaitVSync();
@@ -704,40 +341,15 @@ void RenderBackend_DrawScreen(void)
 	GXColor bg = {0, 0, 0, 0xFF};
 	GX_SetCopyClear(bg, GX_MAX_Z24);
 	
-	// === FRAME START SETUP (for next frame) ===
-	// Invalidate texture cache so any texture updates are visible
-	GX_InvalidateTexAll();
-	textures_dirty = false;
-	
-	// Reset draw state so first draw of next frame sets up vertex descriptors fresh
-	// Note: We don't use GX_InvVtxCache() because we use direct vertex submission,
-	// not indexed arrays. Vertex format changes are synchronized via GX_DrawDone().
-	current_draw_state = GX_DRAW_STATE_NONE;
-	
-	// Memory debugging - check every 5 seconds (300 frames at 60fps)
-	if (frame_count % 300 == 0)
-	{
-		u32 arena_size = SYS_GetArena1Size();
-		if (initial_arena_size == 0)
-			initial_arena_size = arena_size;
-		if (arena_size < min_arena_size)
-			min_arena_size = arena_size;
-		
-		u32 used = initial_arena_size - arena_size;
-		GC_LOG("Frame %d - Arena: %uKB free (used: %uKB, min: %uKB)", 
-			frame_count, arena_size / 1024, used / 1024, min_arena_size / 1024);
-	}
+	if (frame_count <= 5 || frame_count % 60 == 0)
+		GC_LOG("Frame %d", frame_count);
 }
-
-//==============================================================================
-// Public API - Surface Management
-//==============================================================================
 
 RenderBackend_Surface* RenderBackend_CreateSurface(size_t width, size_t height, bool render_target)
 {
 	(void)render_target;
 	
-	RenderBackend_Surface *surface = (RenderBackend_Surface*)SafeMalloc(sizeof(RenderBackend_Surface), "surface struct");
+	RenderBackend_Surface *surface = (RenderBackend_Surface*)malloc(sizeof(RenderBackend_Surface));
 	if (!surface) return NULL;
 	
 	memset(surface, 0, sizeof(RenderBackend_Surface));
@@ -745,30 +357,23 @@ RenderBackend_Surface* RenderBackend_CreateSurface(size_t width, size_t height, 
 	surface->height = height;
 	surface->tex_width = NextPow2(width);
 	surface->tex_height = NextPow2(height);
-	surface->tex_size = surface->tex_width * surface->tex_height * 2;  // RGB5A3 = 2 bytes
 	
-	// Allocate 32-byte aligned texture data
-	surface->texture_data = SafeMemalign(32, surface->tex_size, "surface texture");
+	// Allocate texture data (RGB5A3 = 2 bytes per pixel, 32-byte aligned)
+	size_t tex_size = surface->tex_width * surface->tex_height * 2;
+	surface->texture_data = memalign(32, tex_size);
 	if (!surface->texture_data)
 	{
 		GC_LOG("CreateSurface FAILED: %zux%zu", width, height);
 		free(surface);
 		return NULL;
 	}
-	
-	// Clear texture data
-	memset(surface->texture_data, 0, surface->tex_size);
-	
-	// Flush to main memory
-	DCFlushRange(surface->texture_data, surface->tex_size);
+	memset(surface->texture_data, 0, tex_size);
 	
 	// Initialize texture object
-	GX_InitTexObj(&surface->texObj, surface->texture_data,
-		surface->tex_width, surface->tex_height,
+	GX_InitTexObj(&surface->texObj, surface->texture_data, 
+		surface->tex_width, surface->tex_height, 
 		TEXTURE_FORMAT, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	GX_InitTexObjLOD(&surface->texObj, GX_NEAR, GX_NEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);
-	
-	surface->texture_valid = true;
 	
 	GC_LOG("CreateSurface: %zux%zu (tex: %zux%zu)", width, height, surface->tex_width, surface->tex_height);
 	return surface;
@@ -778,9 +383,6 @@ void RenderBackend_FreeSurface(RenderBackend_Surface *surface)
 {
 	if (surface && surface != framebuffer_surface)
 	{
-		// Ensure GPU isn't using this texture
-		GPU_Sync();
-		
 		if (surface->texture_data)
 			free(surface->texture_data);
 		free(surface);
@@ -790,6 +392,7 @@ void RenderBackend_FreeSurface(RenderBackend_Surface *surface)
 bool RenderBackend_IsSurfaceLost(RenderBackend_Surface *surface) { (void)surface; return false; }
 void RenderBackend_RestoreSurface(RenderBackend_Surface *surface) { (void)surface; }
 
+// Mark a surface as hi-res (for 640x480 text rendering)
 void RenderBackend_SetSurfaceHiRes(RenderBackend_Surface *surface, bool hires)
 {
 	if (surface && surface != framebuffer_surface)
@@ -800,16 +403,12 @@ void RenderBackend_SetSurfaceHiRes(RenderBackend_Surface *surface, bool hires)
 	}
 }
 
-//==============================================================================
-// Public API - Surface Upload
-//==============================================================================
-
 void RenderBackend_UploadSurface(RenderBackend_Surface *surface, const unsigned char *pixels, size_t width, size_t height)
 {
 	if (!surface || !pixels || surface == framebuffer_surface) return;
 	
-	// Prepare for CPU write
-	PrepareSurfaceForCPUWrite(surface);
+	// Ensure GPU is done reading any textures before we modify them
+	GX_DrawDone();
 	
 	// Reallocate if size changed
 	if (surface->width != width || surface->height != height)
@@ -818,14 +417,14 @@ void RenderBackend_UploadSurface(RenderBackend_Surface *surface, const unsigned 
 		surface->height = height;
 		surface->tex_width = NextPow2(width);
 		surface->tex_height = NextPow2(height);
-		surface->tex_size = surface->tex_width * surface->tex_height * 2;
 		
 		if (surface->texture_data)
 			free(surface->texture_data);
 		
-		surface->texture_data = SafeMemalign(32, surface->tex_size, "surface resize");
+		size_t tex_size = surface->tex_width * surface->tex_height * 2;
+		surface->texture_data = memalign(32, tex_size);
 		if (!surface->texture_data) return;
-		memset(surface->texture_data, 0, surface->tex_size);
+		memset(surface->texture_data, 0, tex_size);
 		
 		GX_InitTexObj(&surface->texObj, surface->texture_data,
 			surface->tex_width, surface->tex_height,
@@ -833,7 +432,8 @@ void RenderBackend_UploadSurface(RenderBackend_Surface *surface, const unsigned 
 		GX_InitTexObjLOD(&surface->texObj, GX_NEAR, GX_NEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);
 	}
 	
-	// Convert RGB to RGB5A3 with tiled layout (4x4 tiles)
+	// Convert RGB to RGB5A3 with tiled layout
+	// GX textures use 4x4 tile format for RGB5A3
 	u16 *tex = (u16*)surface->texture_data;
 	
 	for (size_t ty = 0; ty < surface->tex_height; ty += 4)
@@ -873,93 +473,108 @@ void RenderBackend_UploadSurface(RenderBackend_Surface *surface, const unsigned 
 		}
 	}
 	
-	// Flush texture and mark dirty
-	FlushSurfaceTexture(surface);
+	// Flush texture to main memory and mark for cache invalidation
+	DCFlushRange(surface->texture_data, surface->tex_width * surface->tex_height * 2);
+	MarkTexturesDirty();
 }
 
-//==============================================================================
-// Public API - Blit Operations
-//==============================================================================
+// Helper to get pixel from tiled texture
+static inline u16 GetTiledPixel(u16 *tex, size_t tex_width, size_t px, size_t py)
+{
+	size_t tile_x = px / 4;
+	size_t tile_y = py / 4;
+	size_t in_tile_x = px % 4;
+	size_t in_tile_y = py % 4;
+	size_t tiles_per_row = tex_width / 4;
+	size_t tile_idx = tile_y * tiles_per_row + tile_x;
+	size_t pixel_in_tile = in_tile_y * 4 + in_tile_x;
+	return tex[tile_idx * 16 + pixel_in_tile];
+}
+
+// Helper to set pixel in tiled texture
+static inline void SetTiledPixel(u16 *tex, size_t tex_width, size_t px, size_t py, u16 pixel)
+{
+	size_t tile_x = px / 4;
+	size_t tile_y = py / 4;
+	size_t in_tile_x = px % 4;
+	size_t in_tile_y = py % 4;
+	size_t tiles_per_row = tex_width / 4;
+	size_t tile_idx = tile_y * tiles_per_row + tile_x;
+	size_t pixel_in_tile = in_tile_y * 4 + in_tile_x;
+	tex[tile_idx * 16 + pixel_in_tile] = pixel;
+}
 
 void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBackend_Rect *rect, RenderBackend_Surface *destination_surface, long x, long y, bool colour_key)
 {
 	if (!source_surface || !rect) return;
 	
-	//--------------------------------------------------------------------------
-	// Special case: BackupSurface (EFB to texture)
-	//--------------------------------------------------------------------------
+	// Special case: Copy from framebuffer (EFB) to a surface texture
+	// This is used by BackupSurface to capture the screen
 	if (source_surface == framebuffer_surface)
 	{
 		if (!destination_surface || !destination_surface->texture_data) return;
 		
-		// Check if EFB copy buffer is available
-		if (!efb_copy_buffer)
-		{
-			GC_LOG("BackupSurface: No EFB copy buffer available");
-			return;
-		}
+		// Ensure all pending GX commands are complete before EFB copy
+		GX_DrawDone();
 		
-		// Wait for all GPU commands to complete before EFB access
-		GPU_Sync();
-		
-		// Calculate EFB coordinates (game is 320x240, EFB is 640x480)
+		// EFB dimensions (640x480, game renders at 320x240 but GX scales to EFB)
+		// Source region in EFB coordinates (multiply by 2 since game coords are 320x240)
 		u16 efb_x = (u16)(rect->left * 2);
 		u16 efb_y = (u16)(rect->top * 2);
 		u16 efb_w = (u16)((rect->right - rect->left) * 2);
 		u16 efb_h = (u16)((rect->bottom - rect->top) * 2);
 		
-		// EFB copy requires even coordinates
+		// EFB copy requires coordinates to be multiples of 2
 		efb_x &= ~1;
 		efb_y &= ~1;
 		efb_w = (efb_w + 1) & ~1;
 		efb_h = (efb_h + 1) & ~1;
 		
 		// Clamp to EFB bounds
-		if (efb_x + efb_w > EFB_WIDTH) efb_w = EFB_WIDTH - efb_x;
-		if (efb_y + efb_h > EFB_HEIGHT) efb_h = EFB_HEIGHT - efb_y;
+		if (efb_x + efb_w > 640) efb_w = 640 - efb_x;
+		if (efb_y + efb_h > 480) efb_h = 480 - efb_y;
 		
-		// Temp texture dimensions (power of 2)
+		// Texture copy destination dimensions - must copy at EFB size, then downsample on CPU
+		// Use power of 2 dimensions for the temp texture
 		size_t temp_tex_w = NextPow2(efb_w);
 		size_t temp_tex_h = NextPow2(efb_h);
 		
-		// Clamp to pre-allocated buffer size
-		if (temp_tex_w > EFB_COPY_MAX_WIDTH) temp_tex_w = EFB_COPY_MAX_WIDTH;
-		if (temp_tex_h > EFB_COPY_MAX_HEIGHT) temp_tex_h = EFB_COPY_MAX_HEIGHT;
-		
-		// Recalculate EFB dimensions to match buffer constraints
-		if (efb_w > temp_tex_w) efb_w = temp_tex_w;
-		if (efb_h > temp_tex_h) efb_h = temp_tex_h;
-		
-		size_t temp_size = temp_tex_w * temp_tex_h * 4;  // RGBA8
-		
-		// Use pre-allocated buffer instead of allocating every time
-		void *temp_tex = efb_copy_buffer;
+		// Allocate temporary buffer for EFB copy (must be 32-byte aligned)
+		// Using RGBA8 format (4 bytes per pixel) which is more compatible
+		size_t temp_size = temp_tex_w * temp_tex_h * 4;  // RGBA8 = 4 bytes per pixel
+		void *temp_tex = memalign(32, temp_size);
+		if (!temp_tex) 
+		{
+			GC_LOG("BackupSurface: Failed to allocate temp buffer (%zu bytes)", temp_size);
+			return;
+		}
 		memset(temp_tex, 0, temp_size);
 		
-		// Invalidate cache before GPU writes
+		// Invalidate cache range before GX writes to it
 		DCInvalidateRange(temp_tex, temp_size);
 		
-		// Setup EFB copy
+		// Setup EFB copy source region
 		GX_SetTexCopySrc(efb_x, efb_y, efb_w, efb_h);
+		
+		// Setup EFB copy destination - RGBA8 format is more reliable
 		GX_SetTexCopyDst(temp_tex_w, temp_tex_h, GX_TF_RGBA8, GX_FALSE);
 		
-		// Perform copy
-		GX_CopyTex(temp_tex, GX_FALSE);
+		// Perform the EFB to texture copy
+		GX_CopyTex(temp_tex, GX_FALSE);  // GX_FALSE = don't clear EFB
 		
-		// Synchronize
+		// Synchronize - wait for copy to complete before CPU access
 		GX_PixModeSync();
 		GX_DrawDone();
 		
-		// Invalidate cache so CPU sees GPU's writes
+		// Invalidate cache so CPU sees the GPU's writes
 		DCInvalidateRange(temp_tex, temp_size);
 		
-		// Prepare destination for CPU write
-		PrepareSurfaceForCPUWrite(destination_surface);
-		
-		// Downsample from RGBA8 to RGB5A3
+		// Now downsample from temp texture (RGBA8 tiled) to destination surface (RGB5A3 tiled)
+		// RGBA8 uses 4x4 tiles with 64 bytes per tile (4 bytes per pixel, AR then GB pairs)
 		u8 *src_tex = (u8*)temp_tex;
 		u16 *dst_tex = (u16*)destination_surface->texture_data;
 		
+		// Destination dimensions (in game coordinates, half of EFB)
 		size_t dst_w = efb_w / 2;
 		size_t dst_h = efb_h / 2;
 		
@@ -973,11 +588,12 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 				if (dx >= destination_surface->width || dy >= destination_surface->height)
 					continue;
 				
-				// Sample from EFB at 2x coordinates
+				// Sample from EFB at 2x coordinates (simple point sample, could do box filter)
 				size_t sx = px * 2;
 				size_t sy = py * 2;
 				
-				// Read RGBA8 from tiled format (4x4 tiles, AR then GB)
+				// Read RGBA8 pixel from tiled format
+				// RGBA8 tile layout: 4x4 tiles, each tile has AR pairs then GB pairs
 				size_t tile_x = sx / 4;
 				size_t tile_y = sy / 4;
 				size_t in_tile_x = sx % 4;
@@ -986,6 +602,7 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 				size_t tile_idx = tile_y * tiles_per_row + tile_x;
 				size_t pixel_in_tile = in_tile_y * 4 + in_tile_x;
 				
+				// RGBA8 tile: first 32 bytes are AR pairs, next 32 bytes are GB pairs
 				size_t ar_offset = tile_idx * 64 + pixel_in_tile * 2;
 				size_t gb_offset = tile_idx * 64 + 32 + pixel_in_tile * 2;
 				
@@ -998,10 +615,12 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 				u16 pixel;
 				if (a < 224)
 				{
+					// Use ARGB3444 format (has alpha)
 					pixel = ((a >> 5) << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
 				}
 				else
 				{
+					// Use RGB555 format (opaque)
 					pixel = 0x8000 | ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
 				}
 				
@@ -1009,42 +628,37 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 			}
 		}
 		
-		// Note: temp_tex is pre-allocated buffer, don't free it
+		free(temp_tex);
 		
-		// Flush destination and mark dirty
-		FlushSurfaceTexture(destination_surface);
+		// Flush destination texture and mark for cache invalidation
+		DCFlushRange(destination_surface->texture_data, destination_surface->tex_width * destination_surface->tex_height * 2);
+		MarkTexturesDirty();
 		
-		GC_LOG("BackupSurface: EFB (%d,%d %dx%d) -> surface", efb_x, efb_y, efb_w, efb_h);
+		GC_LOG("BackupSurface: Copied EFB (%d,%d %dx%d) -> surface at (%ld,%ld)", 
+		       efb_x, efb_y, efb_w, efb_h, x, y);
 		return;
 	}
 	
-	// Source must have texture data for remaining cases
+	// Regular surface-to-surface or surface-to-framebuffer blit requires source texture data
 	if (!source_surface->texture_data) return;
 	
-	//--------------------------------------------------------------------------
 	// Draw to framebuffer using GX
-	//--------------------------------------------------------------------------
 	if (destination_surface == framebuffer_surface)
 	{
-		// Set projection based on source type
+		// Hi-res surfaces (text lines) use 640x480 projection for sharp rendering
 		if (source_surface->is_hires)
 		{
-			SetProjection(GX_PROJ_HIRES);
+			SetupHiResTextProjection();
 		}
 		else
 		{
-			SetProjection(GX_PROJ_NORMAL);
+			// Restore normal projection for regular sprites
+			RestoreNormalProjection();
 		}
 		
-		// Ensure texture cache is valid
-		EnsureTextureCacheValid();
+		// Sync and invalidate textures before drawing if any were modified
+		SyncAndInvalidateTextures();
 		
-		// Setup draw state
-		SetDrawState_Textured();
-		SetBlendMode(GX_BLEND_NONE);
-		SetAlphaTest(colour_key && source_surface->has_colorkey, 0);
-		
-		// Calculate texture coordinates
 		float tex_w = (float)source_surface->tex_width;
 		float tex_h = (float)source_surface->tex_height;
 		
@@ -1053,17 +667,22 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 		float s1 = (float)rect->right / tex_w;
 		float t1 = (float)rect->bottom / tex_h;
 		
-		// Calculate screen coordinates
+		// For hi-res surfaces, scale destination coordinates to 640x480
 		float scale = source_surface->is_hires ? 2.0f : 1.0f;
 		float x0 = (float)x * scale;
 		float y0 = (float)y * scale;
-		float x1 = x0 + (rect->right - rect->left);
+		float x1 = x0 + (rect->right - rect->left);  // Already scaled in source rect
 		float y1 = y0 + (rect->bottom - rect->top);
 		
-		// Load texture
+		SetupTEVTextured();
+		
+		if (colour_key && source_surface->has_colorkey)
+			GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
+		else
+			GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+		
 		GX_LoadTexObj(&source_surface->texObj, GX_TEXMAP0);
 		
-		// Draw quad
 		GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 			GX_Position2f32(x0, y0);
 			GX_TexCoord2f32(s0, t0);
@@ -1074,18 +693,14 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 			GX_Position2f32(x0, y1);
 			GX_TexCoord2f32(s0, t1);
 		GX_End();
-		
-		GPU_MarkPending();
 		return;
 	}
 	
-	//--------------------------------------------------------------------------
-	// Surface-to-surface copy (CPU)
-	//--------------------------------------------------------------------------
+	// For other surfaces, copy pixel data directly
 	if (!destination_surface || !destination_surface->texture_data) return;
 	
-	// Prepare destination for CPU write
-	PrepareSurfaceForCPUWrite(destination_surface);
+	// Ensure GPU is done before we modify the destination texture
+	GX_DrawDone();
 	
 	u16 *src_tex = (u16*)source_surface->texture_data;
 	u16 *dst_tex = (u16*)destination_surface->texture_data;
@@ -1095,7 +710,7 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 	long width = rect->right - rect->left;
 	long height = rect->bottom - rect->top;
 	
-	// Check if scaling up (normal-res to hi-res)
+	// Check if we need to scale up: normal-res source to hi-res destination
 	bool scale_up = destination_surface->is_hires && !source_surface->is_hires;
 	
 	for (long py = 0; py < height; py++)
@@ -1105,18 +720,23 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 			long sx = src_x + px;
 			long sy = src_y + py;
 			
+			// Bounds check source
 			if (sx < 0 || sy < 0 || (size_t)sx >= source_surface->tex_width || (size_t)sy >= source_surface->tex_height)
 				continue;
 			
 			u16 pixel = GetTiledPixel(src_tex, source_surface->tex_width, sx, sy);
 			
 			// Skip transparent pixels if color key enabled
-			if (colour_key && (pixel & 0x8000) == 0 && (pixel & 0x7000) == 0)
-				continue;
+			if (colour_key)
+			{
+				// RGB5A3: bit 15 = 0 means has alpha, check if alpha is 0
+				if ((pixel & 0x8000) == 0 && (pixel & 0x7000) == 0)
+					continue;  // Fully transparent
+			}
 			
 			if (scale_up)
 			{
-				// Scale up 2x
+				// Scale up 2x: each source pixel becomes a 2x2 block in destination
 				long dx_base = x + px * 2;
 				long dy_base = y + py * 2;
 				
@@ -1136,6 +756,7 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 			}
 			else
 			{
+				// Normal 1:1 copy
 				long dx = x + px;
 				long dy = y + py;
 				
@@ -1147,38 +768,34 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 		}
 	}
 	
-	// Transfer colorkey flag
+	// Mark destination as having color key if source does
 	if (source_surface->has_colorkey)
 		destination_surface->has_colorkey = true;
 	
-	// Flush texture and mark dirty
-	FlushSurfaceTexture(destination_surface);
+	// Flush texture to main memory and mark for cache invalidation
+	DCFlushRange(destination_surface->texture_data, destination_surface->tex_width * destination_surface->tex_height * 2);
+	MarkTexturesDirty();
 }
-
-//==============================================================================
-// Public API - Color Fill
-//==============================================================================
 
 void RenderBackend_ColourFill(RenderBackend_Surface *surface, const RenderBackend_Rect *rect, unsigned char red, unsigned char green, unsigned char blue)
 {
 	if (!rect) return;
 	
-	//--------------------------------------------------------------------------
-	// Fill framebuffer using GX
-	//--------------------------------------------------------------------------
+	// Draw to framebuffer using GX
 	if (surface == framebuffer_surface)
 	{
-		SetProjection(GX_PROJ_NORMAL);
-		EnsureTextureCacheValid();
+		// Restore normal projection if we were in hi-res text mode
+		RestoreNormalProjection();
 		
-		SetDrawState_ColorFill();
-		SetBlendMode(GX_BLEND_NONE);
-		SetAlphaTest(false, 0);
-		
+		// Sync textures before drawing
+		SyncAndInvalidateTextures();
 		float x0 = (float)rect->left;
 		float y0 = (float)rect->top;
 		float x1 = (float)rect->right;
 		float y1 = (float)rect->bottom;
+		
+		SetupTEVColorFill(red, green, blue);
+		GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
 		
 		GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 			GX_Position2f32(x0, y0);
@@ -1190,30 +807,27 @@ void RenderBackend_ColourFill(RenderBackend_Surface *surface, const RenderBacken
 			GX_Position2f32(x0, y1);
 			GX_Color4u8(red, green, blue, 0xFF);
 		GX_End();
-		
-		GPU_MarkPending();
 		return;
 	}
 	
-	//--------------------------------------------------------------------------
-	// Fill surface texture (CPU)
-	//--------------------------------------------------------------------------
+	// For other surfaces, modify texture data directly
 	if (!surface || !surface->texture_data) return;
 	
-	// Prepare for CPU write
-	PrepareSurfaceForCPUWrite(surface);
+	// Ensure GPU is done before we modify the texture
+	GX_DrawDone();
 	
 	// Convert color to RGB5A3
 	bool transparent = (red == 0 && green == 0 && blue == 0);
 	u16 pixel = RGB_to_RGB5A3(red, green, blue, transparent);
 	if (transparent) surface->has_colorkey = true;
 	
-	// Fill rect
+	// Fill rect in tiled texture format
 	size_t x0 = rect->left;
 	size_t y0 = rect->top;
 	size_t x1 = rect->right;
 	size_t y1 = rect->bottom;
 	
+	// Clamp to surface bounds
 	if (x1 > surface->width) x1 = surface->width;
 	if (y1 > surface->height) y1 = surface->height;
 	
@@ -1223,21 +837,29 @@ void RenderBackend_ColourFill(RenderBackend_Surface *surface, const RenderBacken
 	{
 		for (size_t px = x0; px < x1; px++)
 		{
-			SetTiledPixel(tex, surface->tex_width, px, py, pixel);
+			// Calculate tiled texture offset (4x4 tiles)
+			size_t tile_x = px / 4;
+			size_t tile_y = py / 4;
+			size_t in_tile_x = px % 4;
+			size_t in_tile_y = py % 4;
+			
+			size_t tiles_per_row = surface->tex_width / 4;
+			size_t tile_idx = tile_y * tiles_per_row + tile_x;
+			size_t pixel_in_tile = in_tile_y * 4 + in_tile_x;
+			size_t tex_idx = tile_idx * 16 + pixel_in_tile;
+			
+			tex[tex_idx] = pixel;
 		}
 	}
 	
-	// Flush and mark dirty
-	FlushSurfaceTexture(surface);
+	// Flush texture to main memory and mark for cache invalidation
+	DCFlushRange(surface->texture_data, surface->tex_width * surface->tex_height * 2);
+	MarkTexturesDirty();
 }
-
-//==============================================================================
-// Public API - Glyph Atlas Management
-//==============================================================================
 
 RenderBackend_GlyphAtlas* RenderBackend_CreateGlyphAtlas(size_t width, size_t height)
 {
-	RenderBackend_GlyphAtlas *atlas = (RenderBackend_GlyphAtlas*)SafeMalloc(sizeof(RenderBackend_GlyphAtlas), "glyph atlas struct");
+	RenderBackend_GlyphAtlas *atlas = (RenderBackend_GlyphAtlas*)malloc(sizeof(RenderBackend_GlyphAtlas));
 	if (!atlas) return NULL;
 	
 	memset(atlas, 0, sizeof(RenderBackend_GlyphAtlas));
@@ -1245,25 +867,21 @@ RenderBackend_GlyphAtlas* RenderBackend_CreateGlyphAtlas(size_t width, size_t he
 	atlas->height = height;
 	atlas->tex_width = NextPow2(width);
 	atlas->tex_height = NextPow2(height);
-	atlas->tex_size = atlas->tex_width * atlas->tex_height * 2;  // IA8 = 2 bytes
 	
-	atlas->texture_data = SafeMemalign(32, atlas->tex_size, "glyph atlas texture");
+	// Use IA8 format (intensity + alpha, 2 bytes per pixel, 4x4 tiles)
+	size_t tex_size = atlas->tex_width * atlas->tex_height * 2;
+	atlas->texture_data = memalign(32, tex_size);
 	if (!atlas->texture_data)
 	{
 		free(atlas);
 		return NULL;
 	}
-	memset(atlas->texture_data, 0, atlas->tex_size);
-	
-	// Flush to main memory
-	DCFlushRange(atlas->texture_data, atlas->tex_size);
+	memset(atlas->texture_data, 0, tex_size);
 	
 	GX_InitTexObj(&atlas->texObj, atlas->texture_data,
 		atlas->tex_width, atlas->tex_height,
 		GX_TF_IA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	GX_InitTexObjLOD(&atlas->texObj, GX_NEAR, GX_NEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);
-	
-	atlas->texture_valid = true;
 	
 	GC_LOG("CreateGlyphAtlas: %zux%zu (IA8)", width, height);
 	return atlas;
@@ -1273,8 +891,6 @@ void RenderBackend_DestroyGlyphAtlas(RenderBackend_GlyphAtlas *atlas)
 {
 	if (atlas)
 	{
-		GPU_Sync();
-		
 		if (atlas->texture_data)
 			free(atlas->texture_data);
 		free(atlas);
@@ -1285,10 +901,10 @@ void RenderBackend_UploadGlyph(RenderBackend_GlyphAtlas *atlas, size_t x, size_t
 {
 	if (!atlas || !atlas->texture_data || !pixels) return;
 	
-	// Prepare for CPU write
-	PrepareAtlasForCPUWrite(atlas);
+	// Ensure GPU is done reading the atlas before we modify it
+	GX_DrawDone();
 	
-	// IA8 uses 4x4 tiles, 2 bytes per pixel
+	// IA8 uses 4x4 tiles, 2 bytes per pixel (alpha, intensity)
 	u8 *tex = (u8*)atlas->texture_data;
 	
 	for (size_t gy = 0; gy < height; gy++)
@@ -1300,7 +916,7 @@ void RenderBackend_UploadGlyph(RenderBackend_GlyphAtlas *atlas, size_t x, size_t
 			
 			if (dx >= atlas->tex_width || dy >= atlas->tex_height) continue;
 			
-			// Calculate tiled offset
+			// Calculate tiled offset for IA8 (4x4 tiles, 32 bytes per tile)
 			size_t tile_x = dx / 4;
 			size_t tile_y = dy / 4;
 			size_t in_tile_x = dx % 4;
@@ -1309,21 +925,17 @@ void RenderBackend_UploadGlyph(RenderBackend_GlyphAtlas *atlas, size_t x, size_t
 			size_t tiles_per_row = atlas->tex_width / 4;
 			size_t tile_idx = tile_y * tiles_per_row + tile_x;
 			size_t pixel_in_tile = in_tile_y * 4 + in_tile_x;
-			size_t tex_idx = (tile_idx * 16 + pixel_in_tile) * 2;
+			size_t tex_idx = (tile_idx * 16 + pixel_in_tile) * 2;  // 16 pixels per tile, 2 bytes per pixel
 			
 			u8 intensity = pixels[gy * pitch + gx];
 			tex[tex_idx + 0] = intensity;  // Alpha
-			tex[tex_idx + 1] = 0xFF;       // Intensity (white)
+			tex[tex_idx + 1] = 0xFF;       // Intensity (white, color comes from vertex)
 		}
 	}
 	
-	// Flush and mark dirty
-	FlushAtlasTexture(atlas);
+	DCFlushRange(atlas->texture_data, atlas->tex_width * atlas->tex_height * 2);
+	MarkTexturesDirty();
 }
-
-//==============================================================================
-// Public API - Glyph Drawing
-//==============================================================================
 
 void RenderBackend_PrepareToDrawGlyphs(RenderBackend_GlyphAtlas *atlas, RenderBackend_Surface *destination_surface, unsigned char red, unsigned char green, unsigned char blue)
 {
@@ -1334,23 +946,63 @@ void RenderBackend_PrepareToDrawGlyphs(RenderBackend_GlyphAtlas *atlas, RenderBa
 	glyph_b = blue;
 }
 
+// Helper to get IA8 pixel from tiled glyph atlas
+static inline void GetIA8Pixel(u8 *tex, size_t tex_width, size_t px, size_t py, u8 *intensity, u8 *alpha)
+{
+	size_t tile_x = px / 4;
+	size_t tile_y = py / 4;
+	size_t in_tile_x = px % 4;
+	size_t in_tile_y = py % 4;
+	size_t tiles_per_row = tex_width / 4;
+	size_t tile_idx = tile_y * tiles_per_row + tile_x;
+	size_t pixel_in_tile = in_tile_y * 4 + in_tile_x;
+	size_t byte_idx = tile_idx * 32 + pixel_in_tile * 2;
+	
+	*alpha = tex[byte_idx];
+	*intensity = tex[byte_idx + 1];
+}
+
+// Switch to 640x480 projection for high-res text rendering
+static void SetupHiResTextProjection(void)
+{
+	if (!in_hires_text_mode)
+	{
+		Mtx44 ortho;
+		guOrtho(ortho, 0, GAME_HEIGHT * 2, 0, GAME_WIDTH * 2, 0, 1);  // 640x480 projection
+		GX_LoadProjectionMtx(ortho, GX_ORTHOGRAPHIC);
+		in_hires_text_mode = true;
+	}
+}
+
+// Restore normal 320x240 projection
+static void RestoreNormalProjection(void)
+{
+	if (in_hires_text_mode)
+	{
+		Mtx44 ortho;
+		guOrtho(ortho, 0, GAME_HEIGHT, 0, GAME_WIDTH, 0, 1);  // 320x240 projection
+		GX_LoadProjectionMtx(ortho, GX_ORTHOGRAPHIC);
+		in_hires_text_mode = false;
+	}
+}
+
 void RenderBackend_DrawGlyph(long x, long y, size_t gx, size_t gy, size_t gw, size_t gh)
 {
 	if (!glyph_atlas || !glyph_atlas->texture_data) return;
 	
-	//--------------------------------------------------------------------------
-	// Draw to surface (CPU)
-	//--------------------------------------------------------------------------
+	// Draw to non-framebuffer surface: copy pixels directly at full resolution
+	// (Draw.cpp handles coordinate scaling for hi-res text surfaces)
 	if (glyph_dest != framebuffer_surface)
 	{
 		if (!glyph_dest || !glyph_dest->texture_data) return;
 		
-		// Prepare for CPU write
-		PrepareSurfaceForCPUWrite(glyph_dest);
+		// Ensure GPU is done before we modify the destination texture
+		GX_DrawDone();
 		
 		u8 *src_tex = (u8*)glyph_atlas->texture_data;
 		u16 *dst_tex = (u16*)glyph_dest->texture_data;
 		
+		// Draw glyph at full resolution (10x20 font)
 		for (size_t py = 0; py < gh; py++)
 		{
 			for (size_t px = 0; px < gw; px++)
@@ -1363,36 +1015,58 @@ void RenderBackend_DrawGlyph(long x, long y, size_t gx, size_t gy, size_t gw, si
 				if (dx < 0 || dy < 0 || (size_t)dx >= glyph_dest->width || (size_t)dy >= glyph_dest->height)
 					continue;
 				
+				// Get alpha from glyph atlas (IA8 format)
 				u8 intensity, alpha;
-				GetIA8Pixel(src_tex, glyph_atlas->tex_width, sx, sy, &alpha, &intensity);
+				GetIA8Pixel(src_tex, glyph_atlas->tex_width, sx, sy, &intensity, &alpha);
 				
+				// Skip transparent pixels
 				if (alpha < 16) continue;
 				
+				// Create colored pixel with the glyph color
 				u16 pixel = RGB_to_RGB5A3(glyph_r, glyph_g, glyph_b, false);
 				SetTiledPixel(dst_tex, glyph_dest->tex_width, dx, dy, pixel);
 			}
 		}
 		
-		// Flush and mark dirty
-		FlushSurfaceTexture(glyph_dest);
+		// Flush texture and mark for cache invalidation
+		DCFlushRange(glyph_dest->texture_data, glyph_dest->tex_width * glyph_dest->tex_height * 2);
+		MarkTexturesDirty();
 		return;
 	}
 	
-	//--------------------------------------------------------------------------
-	// Draw to framebuffer using GX
-	//--------------------------------------------------------------------------
-	EnsureTextureCacheValid();
+	// Draw to framebuffer using GX at 640x480 resolution for sharp text
+	SyncAndInvalidateTextures();
 	
-	// Use hi-res projection for sharp text
-	SetProjection(GX_PROJ_HIRES);
-	SetDrawState_Glyph();
-	SetBlendMode(GX_BLEND_ALPHA);
-	SetAlphaTest(true, 8);
+	// Switch to 640x480 projection for high-res text
+	SetupHiResTextProjection();
+	
+	// Setup TEV for text: color = vertex color, alpha = texture alpha
+	GX_SetNumChans(1);
+	GX_SetNumTexGens(1);
+	GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+	
+	GX_SetNumTevStages(1);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+	
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+	
+	GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_VTX, GX_SRC_VTX, 0, GX_DF_NONE, GX_AF_NONE);
+	
+	// Alpha blend for text
+	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+	GX_SetAlphaCompare(GX_GREATER, 8, GX_AOP_AND, GX_ALWAYS, 0);
 	
 	// Load atlas texture
 	GX_LoadTexObj(&glyph_atlas->texObj, GX_TEXMAP0);
 	
-	// Calculate texture coordinates
+	// Texture coords (from the 10x20 glyph atlas)
 	float tex_w = (float)glyph_atlas->tex_width;
 	float tex_h = (float)glyph_atlas->tex_height;
 	float s0 = (float)gx / tex_w;
@@ -1400,13 +1074,14 @@ void RenderBackend_DrawGlyph(long x, long y, size_t gx, size_t gy, size_t gw, si
 	float s1 = (float)(gx + gw) / tex_w;
 	float t1 = (float)(gy + gh) / tex_h;
 	
-	// Scale to 640x480
+	// Scale coordinates to 640x480 (input x,y are in 320x240 space)
+	// The glyph size (gw, gh) is already at 10x20 scale
 	float x0 = (float)x * 2.0f;
 	float y0 = (float)y * 2.0f;
-	float x1 = x0 + (float)gw;
-	float y1 = y0 + (float)gh;
+	float x1 = x0 + (float)gw;  // gw is already 10 (not 5), so no extra scaling
+	float y1 = y0 + (float)gh;  // gh is already 20 (not 10)
 	
-	// Draw glyph
+	// Draw glyph at full resolution
 	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 		GX_Position2f32(x0, y0);
 		GX_Color4u8(glyph_r, glyph_g, glyph_b, 0xFF);
@@ -1425,12 +1100,10 @@ void RenderBackend_DrawGlyph(long x, long y, size_t gx, size_t gy, size_t gw, si
 		GX_TexCoord2f32(s0, t1);
 	GX_End();
 	
-	GPU_MarkPending();
+	// Restore state
+	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+	GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
 }
-
-//==============================================================================
-// Public API - Misc
-//==============================================================================
 
 void RenderBackend_HandleRenderTargetLoss(void) {}
 void RenderBackend_HandleWindowResize(size_t width, size_t height) { (void)width; (void)height; }

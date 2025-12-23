@@ -1,0 +1,220 @@
+#---------------------------------------------------------------------------------
+# CSE2 Portable - Nintendo GameCube Port
+# Makefile for devkitPro/devkitPPC
+#---------------------------------------------------------------------------------
+.SUFFIXES:
+#---------------------------------------------------------------------------------
+
+ifeq ($(strip $(DEVKITPPC)),)
+$(error "Please set DEVKITPPC in your environment. export DEVKITPPC=<path to>devkitPPC")
+endif
+
+include $(DEVKITPPC)/gamecube_rules
+
+#---------------------------------------------------------------------------------
+# Configuration
+#---------------------------------------------------------------------------------
+TARGET		:=	CSE2GC
+BUILD		:=	build_gc
+ASSETS_DIR	:=	assets/resources
+DATA_DIR	:=	game_english/data
+
+#---------------------------------------------------------------------------------
+# Compiler flags
+#---------------------------------------------------------------------------------
+CFLAGS		:=	-g -O2 -Wall $(MACHDEP) -DGAMECUBE
+CXXFLAGS	:=	$(CFLAGS) -fno-rtti -fno-exceptions
+LDFLAGS		:=	-g $(MACHDEP) -Wl,-Map,$(TARGET).map
+
+# Uncomment for Japanese build
+#CFLAGS		+=	-DJAPANESE
+#CXXFLAGS	+=	-DJAPANESE
+#DATA_DIR	:=	game_japanese/data
+
+# Bug fixes
+CFLAGS		+=	-DFIX_MAJOR_BUGS
+CXXFLAGS	+=	-DFIX_MAJOR_BUGS
+
+#---------------------------------------------------------------------------------
+# Paths
+#---------------------------------------------------------------------------------
+SRCDIR		:=	$(CURDIR)/src
+BUILDDIR	:=	$(CURDIR)/$(BUILD)
+INCLUDE		:=	-I$(SRCDIR) -I$(SRCDIR)/Backends -I$(LIBOGC_INC)
+LIBS		:=	-laesnd -lfat -logc -lm
+LIBPATHS	:=	-L$(LIBOGC_LIB)
+
+#---------------------------------------------------------------------------------
+# Tools
+#---------------------------------------------------------------------------------
+ifeq ($(OS),Windows_NT)
+BIN2H		:=	$(CURDIR)/bin2h/bin2h.exe
+else
+BIN2H		:=	$(CURDIR)/bin2h/bin2h
+endif
+
+#---------------------------------------------------------------------------------
+# Resource files (for Resource.cpp)
+#---------------------------------------------------------------------------------
+RESOURCE_FILES := \
+	BITMAP/Credit01.bmp BITMAP/Credit02.bmp BITMAP/Credit03.bmp \
+	BITMAP/Credit04.bmp BITMAP/Credit05.bmp BITMAP/Credit06.bmp \
+	BITMAP/Credit07.bmp BITMAP/Credit08.bmp BITMAP/Credit09.bmp \
+	BITMAP/Credit10.bmp BITMAP/Credit11.bmp BITMAP/Credit12.bmp \
+	BITMAP/Credit14.bmp BITMAP/Credit15.bmp BITMAP/Credit16.bmp \
+	BITMAP/Credit17.bmp BITMAP/Credit18.bmp BITMAP/pixel.bmp \
+	CURSOR/CURSOR_IKA.png CURSOR/CURSOR_NORMAL.png ICON/ICON_MINI.png \
+	ORG/Access.org ORG/Anzen.org ORG/Balcony.org ORG/Ballos.org \
+	ORG/BreakDown.org ORG/Cemetery.org ORG/Curly.org ORG/Dr.org \
+	ORG/Ending.org ORG/Escape.org ORG/Fanfale1.org ORG/Fanfale2.org \
+	ORG/Fanfale3.org ORG/FireEye.org ORG/Gameover.org ORG/Ginsuke.org \
+	ORG/Grand.org ORG/Gravity.org ORG/Hell.org ORG/ironH.org \
+	ORG/Jenka.org ORG/Jenka2.org ORG/Kodou.org ORG/LastBtl3.org \
+	ORG/LastBtl.org ORG/LastCave.org ORG/Marine.org ORG/Maze.org \
+	ORG/MDown2.org ORG/Mura.org ORG/Oside.org ORG/Plant.org \
+	ORG/quiet.org ORG/Requiem.org ORG/Toroko.org ORG/Vivi.org \
+	ORG/Wanpak2.org ORG/Wanpaku.org ORG/Weed.org ORG/White.org \
+	ORG/XXXX.org ORG/Zonbie.org WAVE/Wave.dat
+
+RESOURCE_HEADERS := $(addprefix $(SRCDIR)/Resource/,$(addsuffix .h,$(RESOURCE_FILES)))
+
+#---------------------------------------------------------------------------------
+# Data files (entire game data folder)
+#---------------------------------------------------------------------------------
+DATA_FILES := $(shell find $(CURDIR)/$(DATA_DIR) -type f 2>/dev/null)
+DATA_HEADERS := $(patsubst $(CURDIR)/$(DATA_DIR)/%,$(SRCDIR)/DataFiles/%.h,$(DATA_FILES))
+
+#---------------------------------------------------------------------------------
+# Source files
+#---------------------------------------------------------------------------------
+MAIN_SRCS := \
+	ArmsItem Back Bitmap Boss BossAlmo1 BossAlmo2 BossBallos BossFrog \
+	BossIronH BossLife BossOhm BossPress BossTwinD BossX BulHit Bullet \
+	Caret Config Draw Ending Escape Fade File Flags Flash Font Frame \
+	Game Generic GenericLoad Input KeyControl Main Map MapName MiniMap \
+	MyChar MycHit MycParam NpcAct000 NpcAct020 NpcAct040 NpcAct060 \
+	NpcAct080 NpcAct100 NpcAct120 NpcAct140 NpcAct160 NpcAct180 \
+	NpcAct200 NpcAct220 NpcAct240 NpcAct260 NpcAct280 NpcAct300 \
+	NpcAct320 NpcAct340 NpChar NpcHit NpcTbl Organya PixTone Profile \
+	Random Resource SelStage Shoot Sound Stage Star TextScr Triangle \
+	ValueView
+
+MAIN_OBJS := $(addprefix $(BUILDDIR)/,$(addsuffix .o,$(MAIN_SRCS)))
+
+BACKEND_OBJS := \
+	$(BUILDDIR)/Backend_Platform_GameCube.o \
+	$(BUILDDIR)/Backend_Controller_Null.o \
+	$(BUILDDIR)/Backend_Rendering_GameCube.o \
+	$(BUILDDIR)/Backend_Audio_SoftwareMixer.o \
+	$(BUILDDIR)/Backend_Audio_Mixer.o \
+	$(BUILDDIR)/Backend_Audio_GameCube.o
+
+DATA_OBJS := $(BUILDDIR)/DataFiles.o
+
+OBJECTS := $(MAIN_OBJS) $(BACKEND_OBJS) $(DATA_OBJS)
+
+#---------------------------------------------------------------------------------
+# Main targets
+#---------------------------------------------------------------------------------
+.PHONY: all clean run bin2h_tool resources datafiles
+
+all: $(TARGET).dol
+
+$(TARGET).dol: $(TARGET).elf
+	@echo "Creating DOL: $@"
+	@elf2dol $< $@
+	@echo "Build complete: $(TARGET).dol"
+
+$(TARGET).elf: $(BUILDDIR) resources datafiles $(OBJECTS)
+	@echo "Linking: $@"
+	@$(CXX) $(LDFLAGS) $(OBJECTS) $(LIBPATHS) $(LIBS) -o $@
+
+#---------------------------------------------------------------------------------
+# bin2h tool
+#---------------------------------------------------------------------------------
+bin2h_tool: $(BIN2H)
+
+$(BIN2H): $(CURDIR)/bin2h/bin2h.c
+	@echo "Building bin2h..."
+	@gcc -O2 -o $@ $<
+
+#---------------------------------------------------------------------------------
+# Resource headers
+#---------------------------------------------------------------------------------
+resources: bin2h_tool $(RESOURCE_HEADERS)
+
+$(SRCDIR)/Resource/%.h: $(CURDIR)/$(ASSETS_DIR)/%
+	@mkdir -p $(dir $@)
+	@$(BIN2H) "$<" "$@"
+
+#---------------------------------------------------------------------------------
+# Data file headers and DataFiles.cpp
+#---------------------------------------------------------------------------------
+datafiles: bin2h_tool $(DATA_HEADERS) $(SRCDIR)/DataFiles.cpp
+
+$(SRCDIR)/DataFiles/%.h: $(CURDIR)/$(DATA_DIR)/%
+	@mkdir -p $(dir $@)
+	@$(BIN2H) "$<" "$@"
+
+$(SRCDIR)/DataFiles.cpp: $(DATA_HEADERS)
+	@echo "Generating DataFiles.cpp..."
+	@chmod +x $(CURDIR)/tools/gen_datafiles.sh
+	@$(CURDIR)/tools/gen_datafiles.sh "$(CURDIR)/$(DATA_DIR)" "$(SRCDIR)"
+
+#---------------------------------------------------------------------------------
+# Build directory
+#---------------------------------------------------------------------------------
+$(BUILDDIR):
+	@mkdir -p $@
+
+#---------------------------------------------------------------------------------
+# Compilation rules
+#---------------------------------------------------------------------------------
+$(BUILDDIR)/%.o: $(SRCDIR)/%.cpp | $(BUILDDIR)
+	@echo "Compiling: $(notdir $<)"
+	@$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -c $< -o $@
+
+$(BUILDDIR)/DataFiles.o: $(SRCDIR)/DataFiles.cpp | $(BUILDDIR)
+	@echo "Compiling: DataFiles.cpp"
+	@$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -c $< -o $@
+
+$(BUILDDIR)/Backend_Platform_GameCube.o: $(SRCDIR)/Backends/Platform/GameCube.cpp | $(BUILDDIR)
+	@echo "Compiling: Platform/GameCube.cpp"
+	@$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -c $< -o $@
+
+$(BUILDDIR)/Backend_Controller_Null.o: $(SRCDIR)/Backends/Controller/Null.cpp | $(BUILDDIR)
+	@echo "Compiling: Controller/Null.cpp"
+	@$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -c $< -o $@
+
+$(BUILDDIR)/Backend_Rendering_GameCube.o: $(SRCDIR)/Backends/Rendering/GameCube.cpp | $(BUILDDIR)
+	@echo "Compiling: Rendering/GameCube.cpp"
+	@$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -c $< -o $@
+
+$(BUILDDIR)/Backend_Audio_SoftwareMixer.o: $(SRCDIR)/Backends/Audio/SoftwareMixer.cpp | $(BUILDDIR)
+	@echo "Compiling: Audio/SoftwareMixer.cpp"
+	@$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -c $< -o $@
+
+$(BUILDDIR)/Backend_Audio_Mixer.o: $(SRCDIR)/Backends/Audio/SoftwareMixer/Mixer.cpp | $(BUILDDIR)
+	@echo "Compiling: Audio/SoftwareMixer/Mixer.cpp"
+	@$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -c $< -o $@
+
+$(BUILDDIR)/Backend_Audio_GameCube.o: $(SRCDIR)/Backends/Audio/SoftwareMixer/GameCube.cpp | $(BUILDDIR)
+	@echo "Compiling: Audio/SoftwareMixer/GameCube.cpp"
+	@$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -c $< -o $@
+
+-include $(OBJECTS:.o=.d)
+
+#---------------------------------------------------------------------------------
+# Clean
+#---------------------------------------------------------------------------------
+clean:
+	@echo "Cleaning..."
+	@rm -rf $(BUILD) $(TARGET).elf $(TARGET).dol $(TARGET).map
+	@rm -rf $(SRCDIR)/Resource $(SRCDIR)/DataFiles $(SRCDIR)/DataFiles.cpp
+	@rm -f $(BIN2H)
+
+#---------------------------------------------------------------------------------
+# Run
+#---------------------------------------------------------------------------------
+run: $(TARGET).dol
+	dolphin-emu -e $(TARGET).dol

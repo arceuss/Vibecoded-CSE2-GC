@@ -1,0 +1,32 @@
+# Build artifacts
+build_gc/
+build/
+*.o
+*.d
+*.dol
+*.elf
+*.map
+*.exe
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# External dependencies (too large, users should get these separately)
+external/SDL2/
+external/freetype/
+external/glfw/
+
+# Game data (copyrighted, users need to provide their own)
+game_english/
+game_japanese/
+
+# Compiled tools
+bin2h/*.exe

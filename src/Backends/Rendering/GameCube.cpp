@@ -90,6 +90,9 @@ static RenderBackend_GlyphAtlas *glyph_atlas = NULL;
 static RenderBackend_Surface *glyph_dest = NULL;
 static u8 glyph_r, glyph_g, glyph_b;
 
+// Texture tracking - wait for GPU when switching textures to prevent TMEM conflicts
+static void *last_loaded_texture = NULL;
+
 // Hi-res text rendering state (640x480 for text while game is 320x240)
 static bool in_hires_text_mode = false;
 static void SetupHiResTextProjection(void);
@@ -349,6 +352,9 @@ void RenderBackend_DrawScreen(void)
 	// This ensures the next frame's draws use fresh texture data
 	GX_InvVtxCache();
 	GX_InvalidateTexAll();
+	
+	// Reset texture tracking for next frame
+	last_loaded_texture = NULL;
 	
 	if (frame_count <= 5 || frame_count % 60 == 0)
 		GC_LOG("Frame %d", frame_count);
@@ -690,9 +696,17 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 		else
 			GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
 		
-		// Invalidate texture cache before EVERY texture load to prevent random tile corruption
-		GX_InvalidateTexAll();
-		GX_LoadTexObj(&source_surface->texObj, GX_TEXMAP0);
+		// Wait for GPU before switching textures to prevent TMEM conflicts
+		// When texture A is loaded, GPU draws async. If we load texture B into
+		// the same TMEM region before GPU finishes, corruption occurs.
+		if (last_loaded_texture != source_surface->texture_data)
+		{
+			if (last_loaded_texture != NULL)
+				GX_DrawDone();  // Wait for previous texture draws to complete
+			GX_InvalidateTexAll();
+			GX_LoadTexObj(&source_surface->texObj, GX_TEXMAP0);
+			last_loaded_texture = source_surface->texture_data;
+		}
 		
 		GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 			GX_Position2f32(x0, y0);
@@ -1074,11 +1088,15 @@ void RenderBackend_DrawGlyph(long x, long y, size_t gx, size_t gy, size_t gw, si
 	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
 	GX_SetAlphaCompare(GX_GREATER, 8, GX_AOP_AND, GX_ALWAYS, 0);
 	
-	// Invalidate texture cache before loading atlas
-	GX_InvalidateTexAll();
-	
-	// Load atlas texture
-	GX_LoadTexObj(&glyph_atlas->texObj, GX_TEXMAP0);
+	// Wait for GPU before switching to glyph atlas texture
+	if (last_loaded_texture != glyph_atlas->texture_data)
+	{
+		if (last_loaded_texture != NULL)
+			GX_DrawDone();
+		GX_InvalidateTexAll();
+		GX_LoadTexObj(&glyph_atlas->texObj, GX_TEXMAP0);
+		last_loaded_texture = glyph_atlas->texture_data;
+	}
 	
 	// Texture coords (from the 10x20 glyph atlas)
 	float tex_w = (float)glyph_atlas->tex_width;

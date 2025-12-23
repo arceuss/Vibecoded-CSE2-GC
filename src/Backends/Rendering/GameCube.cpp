@@ -42,8 +42,11 @@ static inline void SyncAndInvalidateTextures(void)
 	{
 		// Wait for all pending GX commands to complete
 		GX_DrawDone();
-		// Now safe to invalidate texture cache
+		// Invalidate texture cache
 		GX_InvalidateTexAll();
+		// IMPORTANT: Wait again to ensure invalidation completes before next texture load
+		// Without this, GX_LoadTexObj() might race with the invalidation command
+		GX_DrawDone();
 		textures_need_invalidation = false;
 	}
 }

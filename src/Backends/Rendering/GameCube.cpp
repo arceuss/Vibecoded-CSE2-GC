@@ -700,7 +700,7 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 			GX_Position2f32(x0, y1);
 			GX_TexCoord2f32(s0, t1);
 		GX_End();
-		GX_Flush();  // Ensure draw commands are sent before next state change
+		GX_DrawDone();  // Force complete sync - diagnostic for tile corruption
 		return;
 	}
 	
@@ -815,7 +815,7 @@ void RenderBackend_ColourFill(RenderBackend_Surface *surface, const RenderBacken
 			GX_Position2f32(x0, y1);
 			GX_Color4u8(red, green, blue, 0xFF);
 		GX_End();
-		GX_Flush();  // Ensure draw commands are sent before next state change
+		GX_DrawDone();  // Force complete sync - diagnostic for tile corruption
 		return;
 	}
 	
@@ -1107,7 +1107,7 @@ void RenderBackend_DrawGlyph(long x, long y, size_t gx, size_t gy, size_t gw, si
 		GX_Color4u8(glyph_r, glyph_g, glyph_b, 0xFF);
 		GX_TexCoord2f32(s0, t1);
 	GX_End();
-	GX_Flush();  // Ensure draw commands are sent before next state change
+	GX_DrawDone();  // Force complete sync - diagnostic for tile corruption
 	
 	// Restore state
 	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);

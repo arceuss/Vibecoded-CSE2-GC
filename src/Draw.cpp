@@ -286,11 +286,12 @@ BOOL MakeSurface_Resource(const char *name, SurfaceID surf_no)
 // TODO - Inaccurate stack frame
 BOOL MakeSurface_File(const char *name, SurfaceID surf_no)
 {
-	std::string path = gDataPath + '/' + name + ".pbm";
+	static char path[256];
+	snprintf(path, sizeof(path), "%s/%s.pbm", gDataPath.c_str(), name);
 
-	if (!IsEnableBitmap(path.c_str()))
+	if (!IsEnableBitmap(path))
 	{
-		ErrorLog(path.c_str(), 0);
+		ErrorLog(path, 0);
 		return FALSE;
 	}
 
@@ -311,11 +312,11 @@ BOOL MakeSurface_File(const char *name, SurfaceID surf_no)
 	}
 
 	size_t width, height;
-	unsigned char *image_buffer = DecodeBitmapFromFile(path.c_str(), &width, &height, 3);
+	unsigned char *image_buffer = DecodeBitmapFromFile(path, &width, &height, 3);
 
 	if (image_buffer == NULL)
 	{
-		ErrorLog(path.c_str(), 1);
+		ErrorLog(path, 1);
 		return FALSE;
 	}
 
@@ -377,11 +378,12 @@ BOOL ReloadBitmap_Resource(const char *name, SurfaceID surf_no)
 // TODO - Inaccurate stack frame
 BOOL ReloadBitmap_File(const char *name, SurfaceID surf_no)
 {
-	std::string path = gDataPath + '/' + name + ".pbm";
+	static char path[256];
+	snprintf(path, sizeof(path), "%s/%s.pbm", gDataPath.c_str(), name);
 
-	if (!IsEnableBitmap(path.c_str()))
+	if (!IsEnableBitmap(path))
 	{
-		ErrorLog(path.c_str(), 0);
+		ErrorLog(path, 0);
 		return FALSE;
 	}
 
@@ -396,11 +398,11 @@ BOOL ReloadBitmap_File(const char *name, SurfaceID surf_no)
 	}
 
 	size_t width, height;
-	unsigned char *image_buffer = DecodeBitmapFromFile(path.c_str(), &width, &height, 3);
+	unsigned char *image_buffer = DecodeBitmapFromFile(path, &width, &height, 3);
 
 	if (image_buffer == NULL)
 	{
-		ErrorLog(path.c_str(), 1);
+		ErrorLog(path, 1);
 		return FALSE;
 	}
 
@@ -763,13 +765,16 @@ void InitTextObject(const char *name)
 	// The backend will render at 2x scale for sharp text
 	printf("[Font] InitTextObject: Loading 10x20 bitmap font for 640x480 text\n");
 	
-	std::string bitmap_path = gDataPath + "/Font/font_bitmap_10x20.png";
-	std::string metadata_path = gDataPath + "/Font/font_bitmap_10x20.dat";
+	static char bitmap_path[256];
+	static char metadata_path[256];
+	snprintf(bitmap_path, sizeof(bitmap_path), "%s/Font/font_bitmap_10x20.png", gDataPath.c_str());
+	snprintf(metadata_path, sizeof(metadata_path), "%s/Font/font_bitmap_10x20.dat", gDataPath.c_str());
 	
-	font = LoadBitmapFont(bitmap_path.c_str(), metadata_path.c_str());
+	font = LoadBitmapFont(bitmap_path, metadata_path);
 	printf("[Font] Font loaded: %p\n", font);
 #elif defined(FREETYPE_FONTS)
-	std::string path = gDataPath + "/Font/font";
+	static char path[256];
+	snprintf(path, sizeof(path), "%s/Font/font", gDataPath.c_str());
 
 	// Get font size
 	size_t width, height;
@@ -792,25 +797,25 @@ void InitTextObject(const char *name)
 			break;
 	}
 
-	font = LoadFreeTypeFont(path.c_str(), width, height);
+	font = LoadFreeTypeFont(path, width, height);
 #else
-	std::string bitmap_path;
-	std::string metadata_path;
+	static char bitmap_path[256];
+	static char metadata_path[256];
 
 	switch (mag)
 	{
 		case 1:
-			bitmap_path = gDataPath + "/Font/font_bitmap_6x12.png";
-			metadata_path = gDataPath + "/Font/font_bitmap_6x12.dat";
+			snprintf(bitmap_path, sizeof(bitmap_path), "%s/Font/font_bitmap_6x12.png", gDataPath.c_str());
+			snprintf(metadata_path, sizeof(metadata_path), "%s/Font/font_bitmap_6x12.dat", gDataPath.c_str());
 			break;
 
 		case 2:
-			bitmap_path = gDataPath + "/Font/font_bitmap_10x20.png";
-			metadata_path = gDataPath + "/Font/font_bitmap_10x20.dat";
+			snprintf(bitmap_path, sizeof(bitmap_path), "%s/Font/font_bitmap_10x20.png", gDataPath.c_str());
+			snprintf(metadata_path, sizeof(metadata_path), "%s/Font/font_bitmap_10x20.dat", gDataPath.c_str());
 			break;
 	}
 
-	font = LoadBitmapFont(bitmap_path.c_str(), metadata_path.c_str());
+	font = LoadBitmapFont(bitmap_path, metadata_path);
 #endif
 }
 

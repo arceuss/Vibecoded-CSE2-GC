@@ -25,10 +25,11 @@ BOOL LoadConfigData(CONFIGDATA *conf)
 	memset(conf, 0, sizeof(CONFIGDATA));
 
 	// Get path
-	std::string path = gModulePath + '/' + gConfigName;
+	static char path[256];
+	snprintf(path, sizeof(path), "%s/%s", gModulePath.c_str(), gConfigName);
 
 	// Open file
-	FILE *fp = fopen(path.c_str(), "rb");
+	FILE *fp = fopen(path, "rb");
 	if (fp == NULL)
 		return FALSE;
 

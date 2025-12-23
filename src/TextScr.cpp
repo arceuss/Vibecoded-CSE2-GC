@@ -140,18 +140,18 @@ void EncryptionBinaryData2(unsigned char *pData, long size)
 BOOL LoadTextScript2(const char *name)
 {
 	FILE *fp;
-	std::string path;
+	static char path[256];
 
 	// Get path
-	path = gDataPath + '/' + name;
+	snprintf(path, sizeof(path), "%s/%s", gDataPath.c_str(), name);
 
-	gTS.size = GetFileSizeLong(path.c_str());
+	gTS.size = GetFileSizeLong(path);
 	if (gTS.size == -1)
 		return FALSE;
 
 #ifdef GAMECUBE
-	TSC_LOG("LoadTextScript2: %s (%ld bytes)", path.c_str(), gTS.size);
-	const EmbeddedFile* embedded = FindEmbeddedFile(path.c_str());
+	TSC_LOG("LoadTextScript2: %s (%ld bytes)", path, gTS.size);
+	const EmbeddedFile* embedded = FindEmbeddedFile(path);
 	if (embedded != NULL)
 	{
 		memcpy(gTS.data, embedded->data, gTS.size);
@@ -161,7 +161,7 @@ BOOL LoadTextScript2(const char *name)
 	{
 #endif
 		// Open file
-		fp = fopen(path.c_str(), "rb");
+		fp = fopen(path, "rb");
 		if (fp == NULL)
 			return FALSE;
 
@@ -186,14 +186,14 @@ BOOL LoadTextScript2(const char *name)
 BOOL LoadTextScript_Stage(const char *name)
 {
 	FILE *fp;
-	std::string path;
+	static char path[256];
 	long head_size;
 	long body_size;
 
 	// Open Head.tsc
-	path = gDataPath + "/Head.tsc";
+	snprintf(path, sizeof(path), "%s/Head.tsc", gDataPath.c_str());
 
-	head_size = GetFileSizeLong(path.c_str());
+	head_size = GetFileSizeLong(path);
 	if (head_size == -1)
 		return FALSE;
 
@@ -205,8 +205,8 @@ BOOL LoadTextScript_Stage(const char *name)
 #endif
 
 #ifdef GAMECUBE
-	TSC_LOG("LoadTextScript_Stage Head: %s (%ld bytes)", path.c_str(), head_size);
-	const EmbeddedFile* embedded = FindEmbeddedFile(path.c_str());
+	TSC_LOG("LoadTextScript_Stage Head: %s (%ld bytes)", path, head_size);
+	const EmbeddedFile* embedded = FindEmbeddedFile(path);
 	if (embedded != NULL)
 	{
 		memcpy(gTS.data, embedded->data, head_size);
@@ -216,7 +216,7 @@ BOOL LoadTextScript_Stage(const char *name)
 	else
 	{
 #endif
-		fp = fopen(path.c_str(), "rb");
+		fp = fopen(path, "rb");
 		if (fp == NULL)
 			return FALSE;
 
@@ -230,9 +230,9 @@ BOOL LoadTextScript_Stage(const char *name)
 #endif
 
 	// Open stage's .tsc
-	path = gDataPath + '/' + name;
+	snprintf(path, sizeof(path), "%s/%s", gDataPath.c_str(), name);
 
-	body_size = GetFileSizeLong(path.c_str());
+	body_size = GetFileSizeLong(path);
 	if (body_size == -1)
 		return FALSE;
 
@@ -243,8 +243,8 @@ BOOL LoadTextScript_Stage(const char *name)
 #endif
 
 #ifdef GAMECUBE
-	TSC_LOG("LoadTextScript_Stage Body: %s (%ld bytes)", path.c_str(), body_size);
-	embedded = FindEmbeddedFile(path.c_str());
+	TSC_LOG("LoadTextScript_Stage Body: %s (%ld bytes)", path, body_size);
+	embedded = FindEmbeddedFile(path);
 	if (embedded != NULL)
 	{
 		memcpy(&gTS.data[head_size], embedded->data, body_size);
@@ -254,7 +254,7 @@ BOOL LoadTextScript_Stage(const char *name)
 	else
 	{
 #endif
-		fp = fopen(path.c_str(), "rb");
+		fp = fopen(path, "rb");
 		if (fp == NULL)
 			return FALSE;
 

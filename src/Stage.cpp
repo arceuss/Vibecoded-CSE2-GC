@@ -137,8 +137,7 @@ const STAGE_TABLE gTMT[] = {
 
 BOOL TransferStage(int no, int w, int x, int y)
 {
-	std::string path;
-	std::string path_dir;
+	static char path[256];
 	BOOL bError;
 
 	// Move character
@@ -146,48 +145,41 @@ BOOL TransferStage(int no, int w, int x, int y)
 
 	bError = FALSE;
 
-	// Get path
-	path_dir = "Stage";
-
 	// Load tileset
-	path = path_dir + "/Prt" + gTMT[no].parts;
-	if (!ReloadBitmap_File(path.c_str(), SURFACE_ID_LEVEL_TILESET))
+	snprintf(path, sizeof(path), "Stage/Prt%s", gTMT[no].parts);
+	if (!ReloadBitmap_File(path, SURFACE_ID_LEVEL_TILESET))
 		bError = TRUE;
 
-	path = path_dir + '/' + gTMT[no].parts + ".pxa";
-	if (!LoadAttributeData(path.c_str()))
+	snprintf(path, sizeof(path), "Stage/%s.pxa", gTMT[no].parts);
+	if (!LoadAttributeData(path))
 		bError = TRUE;
 
 	// Load tilemap
-	path = path_dir + '/' + gTMT[no].map + ".pxm";
-	if (!LoadMapData2(path.c_str()))
+	snprintf(path, sizeof(path), "Stage/%s.pxm", gTMT[no].map);
+	if (!LoadMapData2(path))
 		bError = TRUE;
 
 	// Load NPCs
-	path = path_dir + '/' + gTMT[no].map + ".pxe";
-	if (!LoadEvent(path.c_str()))
+	snprintf(path, sizeof(path), "Stage/%s.pxe", gTMT[no].map);
+	if (!LoadEvent(path))
 		bError = TRUE;
 
 	// Load script
-	path = path_dir + '/' + gTMT[no].map + ".tsc";
-	if (!LoadTextScript_Stage(path.c_str()))
+	snprintf(path, sizeof(path), "Stage/%s.tsc", gTMT[no].map);
+	if (!LoadTextScript_Stage(path))
 		bError = TRUE;
 
 	// Load background
-	path = gTMT[no].back;
-	if (!InitBack(path.c_str(), gTMT[no].bkType))
+	if (!InitBack(gTMT[no].back, gTMT[no].bkType))
 		bError = TRUE;
-
-	// Get path
-	path_dir = "Npc";
 
 	// Load NPC sprite sheets
-	path = path_dir + "/Npc" + gTMT[no].npc;
-	if (!ReloadBitmap_File(path.c_str(), SURFACE_ID_LEVEL_SPRITESET_1))
+	snprintf(path, sizeof(path), "Npc/Npc%s", gTMT[no].npc);
+	if (!ReloadBitmap_File(path, SURFACE_ID_LEVEL_SPRITESET_1))
 		bError = TRUE;
 
-	path = path_dir + "/Npc" + gTMT[no].boss;
-	if (!ReloadBitmap_File(path.c_str(), SURFACE_ID_LEVEL_SPRITESET_2))
+	snprintf(path, sizeof(path), "Npc/Npc%s", gTMT[no].boss);
+	if (!ReloadBitmap_File(path, SURFACE_ID_LEVEL_SPRITESET_2))
 		bError = TRUE;
 
 	if (bError)

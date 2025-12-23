@@ -33,18 +33,18 @@ static unsigned long color_black;
 // TODO - Another function that has an incorrect stack frame
 BOOL InitBack(const char *fName, int type)
 {
-	std::string path;
+	static char path[256];
 	FILE *fp;
 
 	color_black = GetCortBoxColor(RGB(0, 0, 0x10));	// Unused. This may have once been used by background type 4 (the solid black background)
 
 	// We're not actually loading the bitmap here - we're just reading its width/height and making sure it's really a BMP file
-	path = gDataPath + '/' + fName + ".pbm";
+	snprintf(path, sizeof(path), "%s/%s.pbm", gDataPath.c_str(), fName);
 
-	BACK_LOG("InitBack: %s", path.c_str());
+	BACK_LOG("InitBack: %s", path);
 
 #ifdef GAMECUBE
-	const EmbeddedFile* embedded = FindEmbeddedFile(path.c_str());
+	const EmbeddedFile* embedded = FindEmbeddedFile(path);
 	if (embedded != NULL)
 	{
 		BACK_LOG("  -> Found embedded: %zu bytes", embedded->size);
@@ -66,7 +66,7 @@ BOOL InitBack(const char *fName, int type)
 	{
 		BACK_LOG("  -> Not in embedded data, trying filesystem...");
 #endif
-		fp = fopen(path.c_str(), "rb");
+		fp = fopen(path, "rb");
 		if (fp == NULL)
 			return FALSE;
 

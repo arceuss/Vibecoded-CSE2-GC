@@ -246,7 +246,7 @@ void ReleaseCreditScript(void)
 BOOL StartCreditScript(void)
 {
 	FILE *fp;
-	std::string path;
+	static char path[256];
 
 	// Clear previously existing credits data
 	if (Credit.pData != NULL)
@@ -256,11 +256,11 @@ BOOL StartCreditScript(void)
 	}
 
 	// Open file
-	path = gDataPath + '/' + credit_script;
+	snprintf(path, sizeof(path), "%s/%s", gDataPath.c_str(), credit_script);
 
-	ENDING_LOG("StartCreditScript: %s", path.c_str());
+	ENDING_LOG("StartCreditScript: %s", path);
 
-	Credit.size = GetFileSizeLong(path.c_str());
+	Credit.size = GetFileSizeLong(path);
 	if (Credit.size == -1)
 		return FALSE;
 
@@ -270,7 +270,7 @@ BOOL StartCreditScript(void)
 		return FALSE;
 
 #ifdef GAMECUBE
-	const EmbeddedFile* embedded = FindEmbeddedFile(path.c_str());
+	const EmbeddedFile* embedded = FindEmbeddedFile(path);
 	if (embedded != NULL)
 	{
 		ENDING_LOG("  -> Found embedded: %zu bytes", embedded->size);
@@ -280,7 +280,7 @@ BOOL StartCreditScript(void)
 	{
 		ENDING_LOG("  -> Not in embedded data, trying filesystem...");
 #endif
-		fp = fopen(path.c_str(), "rb");
+		fp = fopen(path, "rb");
 		if (fp == NULL)
 		{
 			free(Credit.pData);

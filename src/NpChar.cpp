@@ -87,12 +87,13 @@ BOOL LoadEvent(const char *path_event)
 	char code[4];
 	EVENT eve;
 
-	std::string path = gDataPath + '/' + path_event;
+	static char path[256];
+	snprintf(path, sizeof(path), "%s/%s", gDataPath.c_str(), path_event);
 
-	NPCHAR_LOG("LoadEvent: %s", path.c_str());
+	NPCHAR_LOG("LoadEvent: %s", path);
 
 #ifdef GAMECUBE
-	const EmbeddedFile* embedded = FindEmbeddedFile(path.c_str());
+	const EmbeddedFile* embedded = FindEmbeddedFile(path);
 	if (embedded != NULL)
 	{
 		NPCHAR_LOG("  -> Found embedded: %zu bytes", embedded->size);

@@ -36,13 +36,14 @@ const char* const gProfileCode = "Do041220";
 
 BOOL IsProfile(void)
 {
-	std::string path = gModulePath + '/' + gDefaultName;
+	static char path[256];
+	snprintf(path, sizeof(path), "%s/%s", gModulePath.c_str(), gDefaultName);
 
 #ifdef GAMECUBE
-	Backend_PrintInfo("Checking for save file: %s", path.c_str());
+	Backend_PrintInfo("Checking for save file: %s", path);
 #endif
 
-	FILE *file = fopen(path.c_str(), "rb");
+	FILE *file = fopen(path, "rb");
 	if (file == NULL)
 	{
 #ifdef GAMECUBE
@@ -64,7 +65,7 @@ BOOL SaveProfile(const char *name)
 	PROFILEDATA profile;
 	const char *FLAG = "FLAG";
 
-	std::string path;
+	static char path[256];
 
 #ifdef GAMECUBE
 	// Check if SD card is mounted before trying to save
@@ -78,16 +79,16 @@ BOOL SaveProfile(const char *name)
 
 	// Get path
 	if (name != NULL)
-		path = gModulePath + '/' + name;
+		snprintf(path, sizeof(path), "%s/%s", gModulePath.c_str(), name);
 	else
-		path = gModulePath + '/' + gDefaultName;
+		snprintf(path, sizeof(path), "%s/%s", gModulePath.c_str(), gDefaultName);
 
 	// Open file
-	fp = fopen(path.c_str(), "wb");
+	fp = fopen(path, "wb");
 	if (fp == NULL)
 	{
 #ifdef GAMECUBE
-		Backend_PrintError("Failed to open save file: %s", path.c_str());
+		Backend_PrintError("Failed to open save file: %s", path);
 #endif
 		return FALSE;
 	}
@@ -158,24 +159,24 @@ BOOL LoadProfile(const char *name)
 {
 	FILE *fp;
 	PROFILEDATA profile;
-	std::string path;
+	static char path[256];
 
 	// Get path
 	if (name != NULL)
-		path = name;
+		snprintf(path, sizeof(path), "%s", name);
 	else
-		path = gModulePath + '/' + gDefaultName;
+		snprintf(path, sizeof(path), "%s/%s", gModulePath.c_str(), gDefaultName);
 
 #ifdef GAMECUBE
-	Backend_PrintInfo("Loading profile from: %s", path.c_str());
+	Backend_PrintInfo("Loading profile from: %s", path);
 #endif
 
 	// Open file
-	fp = fopen(path.c_str(), "rb");
+	fp = fopen(path, "rb");
 	if (fp == NULL)
 	{
 #ifdef GAMECUBE
-		Backend_PrintInfo("No save file found at: %s", path.c_str());
+		Backend_PrintInfo("No save file found at: %s", path);
 #endif
 		return FALSE;
 	}

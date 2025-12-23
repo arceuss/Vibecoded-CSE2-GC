@@ -139,18 +139,18 @@ BOOL InitSoundObject(const char *resname, int no)
 
 BOOL LoadSoundObject(const char *file_name, int no)
 {
-	std::string path;
+	static char path[256];
 	//unsigned long i;
 	unsigned long file_size = 0;
 	char check_box[58];
 	FILE *fp;
 
-	path = gModulePath + '/' + file_name;
+	snprintf(path, sizeof(path), "%s/%s", gModulePath.c_str(), file_name);
 
 	if (!audio_backend_initialised)
 		return TRUE;
 
-	if ((fp = fopen(path.c_str(), "rb")) == NULL)
+	if ((fp = fopen(path, "rb")) == NULL)
 		return FALSE;
 
 	fseek(fp, 0, SEEK_END);

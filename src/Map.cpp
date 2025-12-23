@@ -44,15 +44,15 @@ BOOL LoadMapData2(const char *path_map)
 {
 	FILE *fp;
 	char check[3];
-	std::string path;
+	static char path[256];
 
 	// Get path
-	path = gDataPath + '/' + path_map;
+	snprintf(path, sizeof(path), "%s/%s", gDataPath.c_str(), path_map);
 
-	MAP_LOG("LoadMapData2: %s", path.c_str());
+	MAP_LOG("LoadMapData2: %s", path);
 
 #ifdef GAMECUBE
-	const EmbeddedFile* embedded = FindEmbeddedFile(path.c_str());
+	const EmbeddedFile* embedded = FindEmbeddedFile(path);
 	if (embedded != NULL)
 	{
 		MAP_LOG("  -> Found embedded: %zu bytes", embedded->size);
@@ -83,7 +83,7 @@ BOOL LoadMapData2(const char *path_map)
 #endif
 
 	// Open file
-	fp = fopen(path.c_str(), "rb");
+	fp = fopen(path, "rb");
 	if (fp == NULL)
 		return FALSE;
 
@@ -117,15 +117,15 @@ BOOL LoadMapData2(const char *path_map)
 BOOL LoadAttributeData(const char *path_atrb)
 {
 	FILE *fp;
-	std::string path;
+	static char path[256];
 
 	// Open file
-	path = gDataPath + '/' + path_atrb;
+	snprintf(path, sizeof(path), "%s/%s", gDataPath.c_str(), path_atrb);
 
-	MAP_LOG("LoadAttributeData: %s", path.c_str());
+	MAP_LOG("LoadAttributeData: %s", path);
 
 #ifdef GAMECUBE
-	const EmbeddedFile* embedded = FindEmbeddedFile(path.c_str());
+	const EmbeddedFile* embedded = FindEmbeddedFile(path);
 	if (embedded != NULL)
 	{
 		MAP_LOG("  -> Found embedded: %zu bytes", embedded->size);
@@ -136,7 +136,7 @@ BOOL LoadAttributeData(const char *path_atrb)
 	MAP_LOG("  -> Not in embedded data, trying filesystem...");
 #endif
 
-	fp = fopen(path.c_str(), "rb");
+	fp = fopen(path, "rb");
 	if (fp == NULL)
 		return FALSE;
 

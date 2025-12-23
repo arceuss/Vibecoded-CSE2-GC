@@ -348,10 +348,8 @@ void RenderBackend_DrawScreen(void)
 	GXColor bg = {0, 0, 0, 0xFF};
 	GX_SetCopyClear(bg, GX_MAX_Z24);
 	
-	// Invalidate caches at frame boundary, like devkitpro examples do at frame start
-	// This ensures the next frame's draws use fresh texture data
+	// Reset vertex cache at frame boundary (devkitpro examples do this)
 	GX_InvVtxCache();
-	GX_InvalidateTexAll();
 	
 	// Reset texture tracking for next frame
 	last_loaded_texture = NULL;
@@ -703,7 +701,6 @@ void RenderBackend_Blit(RenderBackend_Surface *source_surface, const RenderBacke
 		{
 			if (last_loaded_texture != NULL)
 				GX_DrawDone();  // Wait for previous texture draws to complete
-			GX_InvalidateTexAll();
 			GX_LoadTexObj(&source_surface->texObj, GX_TEXMAP0);
 			last_loaded_texture = source_surface->texture_data;
 		}
@@ -1093,7 +1090,6 @@ void RenderBackend_DrawGlyph(long x, long y, size_t gx, size_t gy, size_t gw, si
 	{
 		if (last_loaded_texture != NULL)
 			GX_DrawDone();
-		GX_InvalidateTexAll();
 		GX_LoadTexObj(&glyph_atlas->texObj, GX_TEXMAP0);
 		last_loaded_texture = glyph_atlas->texture_data;
 	}

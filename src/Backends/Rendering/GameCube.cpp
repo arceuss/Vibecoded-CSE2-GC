@@ -382,6 +382,10 @@ static void SetDrawState_Textured(void)
 {
 	if (current_draw_state != GX_DRAW_STATE_TEXTURED)
 	{
+		// Wait for any pending draws to complete before changing vertex format
+		if (current_draw_state != GX_DRAW_STATE_NONE)
+			GX_DrawDone();
+		
 		GX_SetNumChans(0);
 		GX_SetNumTexGens(1);
 		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
@@ -405,6 +409,10 @@ static void SetDrawState_ColorFill(void)
 {
 	if (current_draw_state != GX_DRAW_STATE_COLORFILL)
 	{
+		// Wait for any pending draws to complete before changing vertex format
+		if (current_draw_state != GX_DRAW_STATE_NONE)
+			GX_DrawDone();
+		
 		GX_SetNumChans(1);
 		GX_SetNumTexGens(0);
 		GX_SetNumTevStages(1);
@@ -429,6 +437,10 @@ static void SetDrawState_Glyph(void)
 {
 	if (current_draw_state != GX_DRAW_STATE_GLYPH)
 	{
+		// Wait for any pending draws to complete before changing vertex format
+		if (current_draw_state != GX_DRAW_STATE_NONE)
+			GX_DrawDone();
+		
 		GX_SetNumChans(1);
 		GX_SetNumTexGens(1);
 		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
@@ -693,13 +705,13 @@ void RenderBackend_DrawScreen(void)
 	GX_SetCopyClear(bg, GX_MAX_Z24);
 	
 	// === FRAME START SETUP (for next frame) ===
-	// Following libogc examples pattern: invalidate ALL caches at frame start
-	// This must be done BEFORE any drawing of the next frame
-	GX_InvVtxCache();
+	// Invalidate texture cache so any texture updates are visible
 	GX_InvalidateTexAll();
 	textures_dirty = false;
 	
 	// Reset draw state so first draw of next frame sets up vertex descriptors fresh
+	// Note: We don't use GX_InvVtxCache() because we use direct vertex submission,
+	// not indexed arrays. Vertex format changes are synchronized via GX_DrawDone().
 	current_draw_state = GX_DRAW_STATE_NONE;
 	
 	// Memory debugging - check every 5 seconds (300 frames at 60fps)

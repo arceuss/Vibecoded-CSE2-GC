@@ -95,15 +95,6 @@ static void RestoreNormalProjection(void);
 // Debug
 static int frame_count = 0;
 
-// Vertex format tracking - sync GPU before changing format
-typedef enum {
-	VTX_FMT_NONE,
-	VTX_FMT_TEXTURED,    // pos + tex
-	VTX_FMT_COLORFILL,   // pos + color
-	VTX_FMT_GLYPH        // pos + color + tex
-} VertexFormat;
-static VertexFormat current_vtx_fmt = VTX_FMT_NONE;
-
 // Round up to next power of 2
 static size_t NextPow2(size_t n)
 {
@@ -186,12 +177,6 @@ static void SetupGX(void)
 static void SetupTEVColorFill(u8 r, u8 g, u8 b)
 {
 	(void)r; (void)g; (void)b;  // Color passed via vertex data
-	
-	// Sync GPU if changing vertex format
-	if (current_vtx_fmt != VTX_FMT_COLORFILL && current_vtx_fmt != VTX_FMT_NONE)
-		GX_DrawDone();
-	current_vtx_fmt = VTX_FMT_COLORFILL;
-	
 	GX_SetNumChans(1);
 	GX_SetNumTexGens(0);
 	GX_SetNumTevStages(1);
@@ -211,11 +196,6 @@ static void SetupTEVColorFill(u8 r, u8 g, u8 b)
 // Restore TEV for textured drawing
 static void SetupTEVTextured(void)
 {
-	// Sync GPU if changing vertex format
-	if (current_vtx_fmt != VTX_FMT_TEXTURED && current_vtx_fmt != VTX_FMT_NONE)
-		GX_DrawDone();
-	current_vtx_fmt = VTX_FMT_TEXTURED;
-	
 	GX_SetNumChans(0);
 	GX_SetNumTexGens(1);
 	GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
@@ -362,8 +342,10 @@ void RenderBackend_DrawScreen(void)
 	GXColor bg = {0, 0, 0, 0xFF};
 	GX_SetCopyClear(bg, GX_MAX_Z24);
 	
-	// Reset vertex format tracking for fresh start next frame
-	current_vtx_fmt = VTX_FMT_NONE;
+	// Invalidate caches at frame boundary, like devkitpro examples do at frame start
+	// This ensures the next frame's draws use fresh texture data
+	GX_InvVtxCache();
+	GX_InvalidateTexAll();
 	
 	if (frame_count <= 5 || frame_count % 60 == 0)
 		GC_LOG("Frame %d", frame_count);
@@ -1063,11 +1045,6 @@ void RenderBackend_DrawGlyph(long x, long y, size_t gx, size_t gy, size_t gw, si
 	
 	// Switch to 640x480 projection for high-res text
 	SetupHiResTextProjection();
-	
-	// Sync GPU if changing vertex format
-	if (current_vtx_fmt != VTX_FMT_GLYPH && current_vtx_fmt != VTX_FMT_NONE)
-		GX_DrawDone();
-	current_vtx_fmt = VTX_FMT_GLYPH;
 	
 	// Setup TEV for text: color = vertex color, alpha = texture alpha
 	GX_SetNumChans(1);
